@@ -27,8 +27,9 @@ SIDECAR_BINS := container-images/sidecar/seal/sandbox-seal \
 		container-images/sidecar/hooks/createRuntime/security-policy \
 		container-images/sidecar/hooks/precreate/seal-inject
 
-CLAUDE_SRCS   := container-images/claude/Containerfile
-OPENCODE_SRCS := container-images/opencode/Containerfile
+HELPERS_SRC   := container-images/sandbox-helpers.sh
+CLAUDE_SRCS   := container-images/claude/Containerfile $(HELPERS_SRC)
+OPENCODE_SRCS := container-images/opencode/Containerfile $(HELPERS_SRC)
 
 .PHONY: all test test-integration seal sidecar claude opencode launcher install clean
 
@@ -71,13 +72,11 @@ container-images/sidecar/hooks/precreate/seal-inject: $(SEALINJ_SRCS)
 	@touch $@
 
 .claude.stamp: container-images/sidecar/seal/sandbox-seal $(CLAUDE_SRCS)
-	cp container-images/sidecar/seal/sandbox-seal container-images/claude/sandbox-seal
-	$(CTR) build -f container-images/claude/Containerfile -t $(CLAUDE_IMAGE) container-images/claude/
+	$(CTR) build -f container-images/claude/Containerfile -t $(CLAUDE_IMAGE) container-images/
 	@touch $@
 
 .opencode.stamp: container-images/sidecar/seal/sandbox-seal $(OPENCODE_SRCS)
-	cp container-images/sidecar/seal/sandbox-seal container-images/opencode/sandbox-seal
-	$(CTR) build -f container-images/opencode/Containerfile -t $(OPENCODE_IMAGE) container-images/opencode/
+	$(CTR) build -f container-images/opencode/Containerfile -t $(OPENCODE_IMAGE) container-images/
 	@touch $@
 
 # --- Aliases ---
@@ -97,8 +96,6 @@ clean:
 	rm -f clampdown \
 		.sidecar.stamp .claude.stamp .opencode.stamp \
 		container-images/sidecar/seal/sandbox-seal \
-		container-images/claude/sandbox-seal \
-		container-images/opencode/sandbox-seal \
 		container-images/sidecar/entrypoint/entrypoint \
 		container-images/sidecar/hooks/createRuntime/security-policy \
 		container-images/sidecar/hooks/precreate/seal-inject
