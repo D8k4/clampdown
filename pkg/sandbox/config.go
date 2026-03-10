@@ -56,7 +56,7 @@ func sidecarConfig(
 		StorageDir:     p.Storage,
 		CacheDir:       p.Cache,
 		TempDir:        p.Temp,
-		ProtectedPaths: SidecarProtectedPaths(opts.Workdir, opts.AllowHooks),
+		ProtectedPaths: SidecarProtectedPaths(opts.Workdir, opts.AllowHooks, opts.ProtectPaths),
 		Capabilities: []string{
 			"CHOWN",
 			"DAC_OVERRIDE",
@@ -213,32 +213,37 @@ func findAuthFile() string {
 }
 
 // SidecarProtectedPaths builds read-only mount specs for sensitive workdir
-// paths in the sidecar container. Same paths as the agent's universal
-// protection, applied to the sidecar so a compromised runtime can't modify
-// .git/hooks (host code execution on next git op), .envrc (credential theft),
-// .mcp.json (config tampering), etc.
-func SidecarProtectedPaths(workdir string, allowHooks bool) []container.MountSpec {
+// paths in the sidecar container. Merges the universal protection list with
+// user-specified --protect paths. Applied to the sidecar so a compromised
+// runtime can't modify .git/hooks (host code execution on next git op),
+// .envrc (credential theft), .mcp.json (config tampering), etc.
+//
+// The sidecar's RO overlays also propagate into nested containers via
+// recursive bind mounts (rbind), so nested containers inherit protection
+// without needing seal-inject changes.
+func SidecarProtectedPaths(workdir string, allowHooks bool, extra []string) []container.MountSpec {
+	paths := mounts.MergeProtection(allowHooks)
+	for _, raw := range extra {
+		paths = append(paths, agent.ProtectedPath{
+			Path: strings.TrimSuffix(raw, "/"),
+		})
+	}
+
 	var specs []container.MountSpec
-	for _, p := range mounts.MergeProtection(allowHooks) {
+	for _, p := range paths {
 		if p.GlobalPath {
 			continue
 		}
 		abs := filepath.Join(workdir, p.Path)
-		info, err := os.Stat(abs)
+		_, err := os.Stat(abs)
 		if err != nil {
 			continue // doesn't exist, nothing to protect
 		}
-		if info.IsDir() {
-			// Existing directory — bind-mount read-only.
-			specs = append(specs, container.MountSpec{
-				Source: abs, Dest: abs, RO: true, Type: container.Bind,
-			})
-		} else {
-			// Existing file — overlay with /dev/null.
-			specs = append(specs, container.MountSpec{
-				Dest: abs, Type: container.DevNull,
-			})
-		}
+		// Existing path (file or directory) — bind-mount read-only.
+		// Content stays visible, only writes are blocked.
+		specs = append(specs, container.MountSpec{
+			Source: abs, Dest: abs, RO: true, Type: container.Bind,
+		})
 	}
 	return specs
 }

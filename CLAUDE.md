@@ -57,6 +57,7 @@ Comment types: Function, Design, Why, Teacher, Checklist, Guide. Kill: trivial, 
 | Guard impossible states | Validate boundaries only |
 | Abstract prematurely | Inline until proven otherwise |
 | Leave dead code | Delete completely |
+| Apply a solution without approval | Present approach, discuss, then implement |
 
 ## Security
 
