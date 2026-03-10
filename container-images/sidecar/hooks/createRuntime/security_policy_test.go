@@ -4,6 +4,9 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -419,6 +422,140 @@ func TestCheckImageRef_MissingAnnotation(t *testing.T) {
 	}
 }
 
+func TestParseMountInfo(t *testing.T) {
+	content := strings.Join([]string{
+		"22 1 0:21 / /proc rw,nosuid,nodev,noexec - proc proc rw",
+		"25 1 8:1 / / ro,relatime - ext4 /dev/sda1 rw",
+		"30 1 8:1 / /work rw,relatime - ext4 /dev/sda1 rw",
+		"35 30 8:1 /work/.git/hooks /work/.git/hooks ro,relatime - ext4 /dev/sda1 rw",
+		"36 30 8:1 /work/.envrc /work/.envrc ro,relatime - ext4 /dev/sda1 rw",
+		"40 1 0:22 / /sys ro,nosuid,nodev,noexec - sysfs sysfs ro",
+	}, "\n")
+	path := filepath.Join(t.TempDir(), "mountinfo")
+	err := os.WriteFile(path, []byte(content), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ro := parseMountInfo(path, "/work")
+	if !ro["/work/.git/hooks"] {
+		t.Error("/work/.git/hooks should be RO")
+	}
+	if !ro["/work/.envrc"] {
+		t.Error("/work/.envrc should be RO")
+	}
+	if ro["/"] {
+		t.Error("/ (rootfs) should be excluded")
+	}
+	if ro["/sys"] {
+		t.Error("/sys should be excluded (not under workdir)")
+	}
+	if ro["/work"] {
+		t.Error("/work itself should be excluded (is the workdir, not a sub-mount)")
+	}
+}
+
+func TestCheckMountReadonly_Block_RW(t *testing.T) {
+	roMounts := map[string]bool{"/work/.git/hooks": true}
+	c := baseConfig()
+	c.Mounts = []struct {
+		Source      string   `json:"source"`
+		Destination string   `json:"destination"`
+		Type        string   `json:"type"`
+		Options     []string `json:"options"`
+	}{
+		{Source: "/work/.git/hooks", Destination: "/work/.git/hooks", Options: []string{"bind"}},
+	}
+	err := verifyMountReadonly(c, roMounts)
+	if err == nil {
+		t.Fatal("expected error for RW mount of RO path")
+	}
+}
+
+func TestCheckMountReadonly_Block_Subpath(t *testing.T) {
+	roMounts := map[string]bool{"/work/.git/hooks": true}
+	c := baseConfig()
+	c.Mounts = []struct {
+		Source      string   `json:"source"`
+		Destination string   `json:"destination"`
+		Type        string   `json:"type"`
+		Options     []string `json:"options"`
+	}{
+		{Source: "/work/.git/hooks/pre-commit", Destination: "/hook", Options: []string{"bind"}},
+	}
+	err := verifyMountReadonly(c, roMounts)
+	if err == nil {
+		t.Fatal("expected error for RW mount under RO path")
+	}
+}
+
+func TestCheckMountReadonly_Pass_ExplicitRO(t *testing.T) {
+	roMounts := map[string]bool{"/work/.git/hooks": true}
+	c := baseConfig()
+	c.Mounts = []struct {
+		Source      string   `json:"source"`
+		Destination string   `json:"destination"`
+		Type        string   `json:"type"`
+		Options     []string `json:"options"`
+	}{
+		{Source: "/work/.git/hooks", Destination: "/work/.git/hooks", Options: []string{"bind", "ro"}},
+	}
+	err := verifyMountReadonly(c, roMounts)
+	if err != nil {
+		t.Errorf("expected pass for explicit ro, got: %v", err)
+	}
+}
+
+func TestCheckMountReadonly_Pass_NotProtected(t *testing.T) {
+	roMounts := map[string]bool{"/work/.git/hooks": true}
+	c := baseConfig()
+	c.Mounts = []struct {
+		Source      string   `json:"source"`
+		Destination string   `json:"destination"`
+		Type        string   `json:"type"`
+		Options     []string `json:"options"`
+	}{
+		{Source: "/work/src", Destination: "/work/src", Options: []string{"bind"}},
+	}
+	err := verifyMountReadonly(c, roMounts)
+	if err != nil {
+		t.Errorf("expected pass for non-protected path, got: %v", err)
+	}
+}
+
+func TestCheckMountReadonly_Skip_PseudoFS(t *testing.T) {
+	roMounts := map[string]bool{"/proc": true}
+	c := baseConfig()
+	c.Mounts = []struct {
+		Source      string   `json:"source"`
+		Destination string   `json:"destination"`
+		Type        string   `json:"type"`
+		Options     []string `json:"options"`
+	}{
+		{Source: "proc", Destination: "/proc", Type: "proc"},
+	}
+	err := verifyMountReadonly(c, roMounts)
+	if err != nil {
+		t.Errorf("expected pass for pseudo-fs mount, got: %v", err)
+	}
+}
+
+func TestCheckMountReadonly_Pass_NoProtectedPaths(t *testing.T) {
+	c := baseConfig()
+	c.Mounts = []struct {
+		Source      string   `json:"source"`
+		Destination string   `json:"destination"`
+		Type        string   `json:"type"`
+		Options     []string `json:"options"`
+	}{
+		{Source: "/work/.git/hooks", Destination: "/work/.git/hooks", Options: []string{"bind"}},
+	}
+	err := verifyMountReadonly(c, nil)
+	if err != nil {
+		t.Errorf("expected pass when no protected paths exist, got: %v", err)
+	}
+}
+
 // TestAllChecksPass verifies a well-formed config passes all checks.
 func TestAllChecksPass(t *testing.T) {
 	t.Setenv("SANDBOX_WORKDIR", "/work")
@@ -442,6 +579,7 @@ func TestAllChecksPass(t *testing.T) {
 		{"sysctl", checkSysctl},
 		{"rlimits", checkRlimits},
 		{"imageRef", checkImageRef},
+		{"mountReadonly", checkMountReadonly},
 	}
 	for _, tc := range checks {
 		err := tc.check(c)

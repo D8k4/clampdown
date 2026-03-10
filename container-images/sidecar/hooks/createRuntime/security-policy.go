@@ -465,6 +465,73 @@ func checkDevices(config Config) error {
 	return nil
 }
 
+// checkMountReadonly blocks RW bind mounts whose source falls on or under
+// a read-only mount point in the sidecar. This prevents nested containers
+// from re-mounting protected paths (e.g., .git/hooks, .envrc) as writable
+// by explicitly passing -v source:dest without :ro.
+func checkMountReadonly(config Config) error {
+	roMounts := parseMountInfo("/proc/self/mountinfo", os.Getenv("SANDBOX_WORKDIR"))
+	return verifyMountReadonly(config, roMounts)
+}
+
+// parseMountInfo reads a mountinfo file and returns the set of mount points
+// that are read-only and under the workdir. Only workdir sub-mounts represent
+// protected paths (e.g., .git/hooks, .envrc). Mounts outside workdir are
+// forbidden anyway.
+func parseMountInfo(path, workdir string) map[string]bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		logf("parseMountInfo: %v", err)
+		return nil
+	}
+	ro := make(map[string]bool)
+	for line := range strings.SplitSeq(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		mountpoint := fields[4]
+		if !isSubPath(workdir, mountpoint) || mountpoint == workdir {
+			continue
+		}
+		opts := fields[5]
+		for opt := range strings.SplitSeq(opts, ",") {
+			if opt == "ro" {
+				ro[mountpoint] = true
+				break
+			}
+		}
+	}
+	return ro
+}
+
+func verifyMountReadonly(config Config, roMounts map[string]bool) error {
+	for _, m := range config.Mounts {
+		if !strings.HasPrefix(m.Source, "/") {
+			continue
+		}
+
+		// RO is ok, harmless
+		if hasOpt(m.Options, "ro") {
+			continue
+		}
+		source := m.Source
+		resolved, symErr := filepath.EvalSymlinks(source)
+		if symErr == nil {
+			source = resolved
+		}
+		for roPath := range roMounts {
+			if isSubPath(roPath, source) {
+				return blocked(int(syscall.EACCES),
+					"mount of '%s' not permitted as writable — path is read-only in sidecar (protected by '%s')",
+					m.Source, roPath,
+				)
+			}
+		}
+	}
+	return nil
+}
+
 func main() {
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -504,6 +571,7 @@ func main() {
 		checkSysctl,
 		checkRlimits,
 		checkImageRef,
+		checkMountReadonly,
 	}
 	for _, check := range checks {
 		err = check(config)
