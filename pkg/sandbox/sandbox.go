@@ -153,6 +153,20 @@ func Run(ctx context.Context, rt container.Runtime, ag agent.Agent, opts Options
 		}
 	}
 
+	// Determine active proxy route (first matching key from host env + rcEnv).
+	// Nil means no API key is set — the agent starts without a proxy (e.g.,
+	// Claude OAuth login).
+	proxyRoute := ActiveProxyRoute(ag, rcEnv)
+	if proxyRoute == nil && len(ag.ProxyRoutes()) > 0 {
+		slog.Warn("no API key found — starting without auth proxy",
+			"agent", ag.Name())
+	}
+
+	proxyName := ""
+	if proxyRoute != nil {
+		proxyName = fmt.Sprintf("%s-%d-proxy", containerPrefix, pid)
+	}
+
 	var once sync.Once
 	sigCh := make(chan os.Signal, 1)
 	done := make(chan struct{})
@@ -166,7 +180,7 @@ func Run(ctx context.Context, rt container.Runtime, ag agent.Agent, opts Options
 		if tw != nil {
 			tw.Stop()
 		}
-		cleanup(&once, rt, agentName, sidecarName, created)
+		cleanup(&once, rt, agentName, proxyName, sidecarName, created)
 	}()
 	go func() {
 		select {
@@ -174,7 +188,7 @@ func Run(ctx context.Context, rt container.Runtime, ag agent.Agent, opts Options
 			if tw != nil {
 				tw.Stop()
 			}
-			cleanup(&once, rt, agentName, sidecarName, created)
+			cleanup(&once, rt, agentName, proxyName, sidecarName, created)
 			os.Exit(1)
 		case <-done:
 		}
@@ -200,10 +214,33 @@ func Run(ctx context.Context, rt container.Runtime, ag agent.Agent, opts Options
 	}
 	slog.Info("container API ready")
 
+	// Start auth proxy if a proxy route is active.
+	if proxyRoute != nil {
+		proxyCfg := ProxyConfig(
+			proxyName, sidecarName, pid, opts,
+			ag, proxyRoute, agentSeccomp, rcEnv,
+		)
+		slog.Info("starting auth proxy", "upstream", proxyRoute.Upstream)
+		err = rt.StartProxy(runCtx, proxyCfg)
+		if err != nil {
+			return fmt.Errorf("start proxy: %w", err)
+		}
+
+		err = waitProxyReady(runCtx, rt, proxyName)
+		if err != nil {
+			logs, _ := rt.Logs(ctx, proxyName)
+			if len(logs) > 0 {
+				slog.Error("proxy logs", "output", string(logs))
+			}
+			return err
+		}
+		slog.Info("auth proxy ready")
+	}
+
 	agentCfg := agentConfig(
 		agentName, sidecarName, pid, opts,
 		ag, mnts, agentSeccomp,
-		p.Home, rcEnv,
+		p.Home, proxyRoute,
 	)
 
 	err = rt.StartAgent(runCtx, agentCfg)
@@ -231,13 +268,32 @@ func waitReady(ctx context.Context, rt container.Runtime, sidecar string) error 
 	return fmt.Errorf("sidecar did not become ready within %ds", readinessTimeout)
 }
 
-func cleanup(once *sync.Once, rt container.Runtime, agent, sidecar string, created []string) {
+func cleanup(once *sync.Once, rt container.Runtime, agentName, proxyName, sidecar string, created []string) {
 	once.Do(func() {
-		_ = rt.Remove(context.Background(), agent, sidecar)
+		// Remove order: agent → proxy → sidecar.
+		// Agent depends on sidecar's network namespace; proxy does too.
+		names := []string{agentName}
+		if proxyName != "" {
+			names = append(names, proxyName)
+		}
+		names = append(names, sidecar)
+		_ = rt.Remove(context.Background(), names...)
 		for _, p := range created {
 			_ = os.RemoveAll(p)
 		}
 	})
+}
+
+// waitProxyReady polls the proxy container logs for the "proxy: ready" line.
+func waitProxyReady(ctx context.Context, rt container.Runtime, proxyName string) error {
+	for range readinessTimeout {
+		logs, err := rt.Logs(ctx, proxyName)
+		if err == nil && strings.Contains(string(logs), "proxy: ready") {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("proxy did not become ready within %ds", readinessTimeout)
 }
 
 // warnIfRootful prints a warning when the container runtime runs as real root.
@@ -261,7 +317,7 @@ func warnIfRootful(ctx context.Context, rt container.Runtime) {
 // Hard-fails if Landlock is confirmed absent (file readable, not in list).
 // Warns if /sys/kernel/security/lsm is unreadable (can't confirm — let
 // seal do the final enforcement inside the container).
-// Warns if kernel < 6.7 (Landlock present but lacks V6 IPC scoping).
+// Warns if kernel < 6.12 (Landlock present but lacks IPC + TCP scoping).
 func checkLandlock() error {
 	lsm, readErr := os.ReadFile("/sys/kernel/security/lsm")
 	if readErr != nil {
@@ -281,14 +337,12 @@ func checkLandlock() error {
 
 	major, minor := kernelVersion()
 
-	// Landlock V6 (IPC scoping) requires kernel >= 6.7.
+	// Landlock IPC + TCP scoping requires kernel >= 6.12.
 	// Warn if we can't determine the version (major == 0) or it's too old.
-	if major == 0 || major < 6 || (major == 6 && minor < 7) {
+	if major == 0 || major < 6 || (major == 6 && minor < 12) {
 		fmt.Fprintf(os.Stderr, "\n"+
-			"  ⚠️  Kernel %d.%d lacks Landlock IPC scoping (needs 6.7+).\n"+
-			"  Abstract unix socket isolation is not enforced.\n"+
-			"  Nested containers can reach the sidecar's podman API socket.\n"+
-			"  Consider upgrading to kernel 6.7+ for full Landlock V6 support.\n\n",
+			"  ⚠️  Kernel %d.%d lacks Landlock IPC and TCP scoping (needs 6.12+).\n"+
+			"  Consider upgrading to kernel 6.12+ for full Landlock V6 support.\n\n",
 			major, minor)
 	}
 

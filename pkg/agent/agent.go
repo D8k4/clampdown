@@ -11,6 +11,20 @@ import (
 // Home is the user's home directory, resolved once at startup.
 var Home = os.Getenv("HOME")
 
+const ProxyPort = 2376
+
+// ProxyRoute describes a single upstream API that the auth proxy handles.
+type ProxyRoute struct {
+	Port           uint16
+	Upstream       string
+	KeyEnv         string
+	KeyEnvFallback string
+	HeaderName     string
+	HeaderPrefix   string
+	BaseURLEnv     string
+	ProviderID     string
+}
+
 // Agent describes an AI tool that runs inside the sandbox.
 type Agent interface {
 	Name() string
@@ -20,17 +34,9 @@ type Agent interface {
 	ConfigOverlays() []Mount
 	Env() map[string]string
 	Args(passthrough []string) []string
-	// PromptFile returns the container-side path where the launcher
-	// should write the sandbox instructions. The agent reads this file
-	// via its native prompt discovery mechanism:
-	//   Claude:   --append-system-prompt-file (passed via Args)
-	//   OpenCode: ~/.config/opencode/instructions.md (auto-discovered)
-	// Return "" if the agent has no prompt file mechanism.
 	PromptFile() string
-	// ForwardEnv returns host environment variable names to forward into
-	// the agent container. Used for API keys and auth tokens. Only
-	// variables that are set on the host are forwarded.
-	ForwardEnv() []string
+	ProxyRoutes() []ProxyRoute
+	ProxyEnvOverride(routes []ProxyRoute) map[string]string
 }
 
 // Mount describes a bind mount from host to container.
@@ -132,9 +138,15 @@ Do NOT retry — wait for user to allow the domain.
 ## Multi-container workflows
 Both "docker compose" (plugin) and "docker-compose" (standalone) are available.
 DOCKER_HOST points at the sidecar podman API — compose works transparently.
-Start service dependencies: podman run -d --name db postgres, redis, mysql, etc.
-Container-to-container DNS works on podman bridge networks (netavark).
 podman build works for project images (cached in sidecar storage).
+
+Use podman networks for container-to-container communication. Do NOT use -p port
+publishing or localhost connections between containers — use named networks:
+	podman network create mynet
+	podman run -d --name db --network mynet postgres
+	podman run -d --name app --network mynet myapp
+	podman run --rm --network mynet alpine wget -qO- http://db:5432
+Containers on the same network resolve each other by name via DNS (netavark).
 
 After "docker compose up", always verify health before proceeding:
 	docker compose ps        # check all services are "Up" / "healthy"
@@ -146,4 +158,5 @@ Known limitations:
 	docker compose watch: not supported (podman API lacks file-watch events)
 	BuildKit features: podman serves Buildah, not BuildKit
 	--gpus: use CDI syntax --device nvidia.com/gpu=all instead
+	-p port publishing: blocked by Landlock — use podman networks instead
 `

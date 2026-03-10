@@ -2,7 +2,11 @@
 
 package agent
 
-import "path/filepath"
+import (
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+)
 
 // OpenCode implements Agent for the OpenCode CLI (anomalyco/opencode).
 type OpenCode struct{}
@@ -57,18 +61,60 @@ func (o *OpenCode) PromptFile() string {
 	return filepath.Join(Home, ".config", "opencode", "AGENTS.md")
 }
 
-func (o *OpenCode) ForwardEnv() []string {
-	// OpenCode is multi-provider. Forward all common provider keys —
-	// only those set on the host are passed through.
-	return []string{
-		"ANTHROPIC_API_KEY",
-		"OPENAI_API_KEY",
-		"GEMINI_API_KEY",
-		"OPENROUTER_API_KEY",
-		"GROQ_API_KEY",
-		"DEEPSEEK_API_KEY",
-		"MISTRAL_API_KEY",
-		"XAI_API_KEY",
-		"OPENCODE_API_KEY",
+// ProxyRoutes returns upstream API routes for all supported providers.
+func (o *OpenCode) ProxyRoutes() []ProxyRoute {
+	return []ProxyRoute{
+		{Port: ProxyPort, Upstream: "https://api.anthropic.com/v1",
+			KeyEnv: "ANTHROPIC_API_KEY", HeaderName: "x-api-key",
+			BaseURLEnv: "ANTHROPIC_BASE_URL"},
+		{Port: ProxyPort, Upstream: "https://api.openai.com/v1",
+			KeyEnv: "OPENAI_API_KEY", HeaderName: "Authorization", HeaderPrefix: "Bearer ",
+			BaseURLEnv: "OPENAI_BASE_URL"},
+		{Port: ProxyPort, Upstream: "https://generativelanguage.googleapis.com",
+			KeyEnv: "GOOGLE_GENERATIVE_AI_API_KEY", KeyEnvFallback: "GEMINI_API_KEY",
+			HeaderName: "x-goog-api-key",
+			ProviderID: "google"},
+		{Port: ProxyPort, Upstream: "https://api.groq.com/openai/v1",
+			KeyEnv: "GROQ_API_KEY", HeaderName: "Authorization", HeaderPrefix: "Bearer ",
+			ProviderID: "groq"},
+		{Port: ProxyPort, Upstream: "https://api.deepseek.com/v1",
+			KeyEnv: "DEEPSEEK_API_KEY", HeaderName: "Authorization", HeaderPrefix: "Bearer ",
+			ProviderID: "deepseek"},
+		{Port: ProxyPort, Upstream: "https://api.mistral.ai/v1",
+			KeyEnv: "MISTRAL_API_KEY", HeaderName: "Authorization", HeaderPrefix: "Bearer ",
+			ProviderID: "mistral"},
+		{Port: ProxyPort, Upstream: "https://api.x.ai/v1",
+			KeyEnv: "XAI_API_KEY", HeaderName: "Authorization", HeaderPrefix: "Bearer ",
+			ProviderID: "xai"},
+		{Port: ProxyPort, Upstream: "https://openrouter.ai/api/v1",
+			KeyEnv: "OPENROUTER_API_KEY", HeaderName: "Authorization", HeaderPrefix: "Bearer ",
+			ProviderID: "openrouter"},
+		{Port: ProxyPort, Upstream: "https://opencode.ai/zen/v1",
+			KeyEnv: "OPENCODE_API_KEY", HeaderName: "Authorization", HeaderPrefix: "Bearer ",
+			ProviderID: "opencode"},
 	}
+}
+
+// ProxyEnvOverride builds OPENCODE_CONFIG_CONTENT for providers whose SDK
+// doesn't read a *_BASE_URL env var. The JSON is deep-merged by OpenCode
+// at highest precedence — no clobbering of user config.
+func (o *OpenCode) ProxyEnvOverride(routes []ProxyRoute) map[string]string {
+	providers := make(map[string]any)
+	for _, r := range routes {
+		if r.ProviderID == "" {
+			continue
+		}
+		providers[r.ProviderID] = map[string]any{
+			"options": map[string]any{
+				"baseURL": fmt.Sprintf("http://localhost:%d", r.Port),
+			},
+		}
+	}
+	if len(providers) == 0 {
+		return nil
+	}
+
+	cfg := map[string]any{"provider": providers}
+	data, _ := json.Marshal(cfg)
+	return map[string]string{"OPENCODE_CONFIG_CONTENT": string(data)}
 }

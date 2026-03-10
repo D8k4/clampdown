@@ -23,7 +23,7 @@ func TestAgentLandlockPolicy(t *testing.T) {
 		{Path: "/home", NoExec: false},
 	}
 
-	raw := sandbox.AgentLandlockPolicy(mounts, tmpfs)
+	raw := sandbox.AgentLandlockPolicy(mounts, tmpfs, nil)
 
 	var p sandbox.LandlockPolicy
 	err := json.Unmarshal([]byte(raw), &p)
@@ -69,6 +69,39 @@ func TestAgentLandlockPolicy(t *testing.T) {
 	}
 	if !found {
 		t.Error("/home should be in WriteExec")
+	}
+
+	// nil connectPorts -> no ConnectTCP restriction
+	if len(p.ConnectTCP) != 0 {
+		t.Errorf("ConnectTCP should be empty with nil ports, got %v", p.ConnectTCP)
+	}
+}
+
+func TestAgentLandlockPolicy_WithConnectTCP(t *testing.T) {
+	mounts := []container.MountSpec{
+		{Source: "/work", Dest: "/work", Type: container.Bind},
+	}
+	tmpfs := []container.TmpfsSpec{
+		{Path: "/tmp", NoExec: true},
+	}
+	ports := []uint16{2375, 8001}
+
+	raw := sandbox.AgentLandlockPolicy(mounts, tmpfs, ports)
+
+	var p sandbox.LandlockPolicy
+	err := json.Unmarshal([]byte(raw), &p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(p.ConnectTCP) != 2 {
+		t.Fatalf("ConnectTCP: want 2 ports, got %d", len(p.ConnectTCP))
+	}
+	if p.ConnectTCP[0] != 2375 {
+		t.Errorf("ConnectTCP[0] = %d, want 2375", p.ConnectTCP[0])
+	}
+	if p.ConnectTCP[1] != 8001 {
+		t.Errorf("ConnectTCP[1] = %d, want 8001", p.ConnectTCP[1])
 	}
 }
 

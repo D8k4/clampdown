@@ -4,12 +4,14 @@ CTR ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null ||
 SIDECAR_IMAGE  := clampdown-sidecar:latest
 CLAUDE_IMAGE   := clampdown-claude:latest
 OPENCODE_IMAGE := clampdown-opencode:latest
+PROXY_IMAGE    := clampdown-proxy:latest
 
 # Go binary sources
 SEAL_SRCS       := container-images/sidecar/seal/seal.go container-images/sidecar/seal/go.mod container-images/sidecar/seal/go.sum
 ENTRYPOINT_SRCS := container-images/sidecar/entrypoint/entrypoint.go container-images/sidecar/entrypoint/go.mod
 SECPOL_SRCS     := container-images/sidecar/hooks/createRuntime/security-policy.go container-images/sidecar/hooks/createRuntime/go.mod
 SEALINJ_SRCS    := container-images/sidecar/hooks/precreate/seal-inject.go container-images/sidecar/hooks/precreate/go.mod
+PROXY_SRCS      := container-images/proxy/proxy.go container-images/proxy/go.mod
 
 # All sidecar container inputs (non-Go sources)
 SIDECAR_SRCS := container-images/sidecar/Containerfile \
@@ -31,9 +33,9 @@ HELPERS_SRC   := container-images/sandbox-helpers.sh
 CLAUDE_SRCS   := container-images/claude/Containerfile $(HELPERS_SRC)
 OPENCODE_SRCS := container-images/opencode/Containerfile $(HELPERS_SRC)
 
-.PHONY: all test test-integration seal sidecar claude opencode launcher install clean
+.PHONY: all test test-integration seal sidecar claude opencode proxy launcher install clean
 
-all: .sidecar.stamp .claude.stamp .opencode.stamp launcher
+all: .sidecar.stamp .claude.stamp .opencode.stamp .proxy.stamp launcher
 
 test:
 	go test -v ./pkg/...
@@ -65,6 +67,9 @@ container-images/sidecar/hooks/createRuntime/security-policy: $(SECPOL_SRCS)
 container-images/sidecar/hooks/precreate/seal-inject: $(SEALINJ_SRCS)
 	cd container-images/sidecar/hooks/precreate && CGO_ENABLED=0 go build -ldflags='-s -w' -o seal-inject .
 
+container-images/proxy/auth-proxy: $(PROXY_SRCS)
+	cd container-images/proxy && CGO_ENABLED=0 go build -ldflags='-s -w' -o auth-proxy .
+
 # --- Container images (stamp-based, skip when sources unchanged) ---
 
 .sidecar.stamp: $(SIDECAR_BINS) $(SIDECAR_SRCS)
@@ -79,12 +84,17 @@ container-images/sidecar/hooks/precreate/seal-inject: $(SEALINJ_SRCS)
 	$(CTR) build -f container-images/opencode/Containerfile -t $(OPENCODE_IMAGE) container-images/
 	@touch $@
 
+.proxy.stamp: container-images/proxy/auth-proxy container-images/sidecar/seal/sandbox-seal container-images/proxy/Containerfile
+	$(CTR) build -f container-images/proxy/Containerfile -t $(PROXY_IMAGE) container-images/
+	@touch $@
+
 # --- Aliases ---
 
 seal: container-images/sidecar/seal/sandbox-seal
 sidecar: .sidecar.stamp
 claude: .claude.stamp
 opencode: .opencode.stamp
+proxy: .proxy.stamp
 
 launcher:
 	CGO_ENABLED=0 go build -ldflags='-s -w' -o clampdown .
@@ -94,11 +104,13 @@ install: launcher
 
 clean:
 	rm -f clampdown \
-		.sidecar.stamp .claude.stamp .opencode.stamp \
+		.sidecar.stamp .claude.stamp .opencode.stamp .proxy.stamp \
 		container-images/sidecar/seal/sandbox-seal \
 		container-images/sidecar/entrypoint/entrypoint \
 		container-images/sidecar/hooks/createRuntime/security-policy \
-		container-images/sidecar/hooks/precreate/seal-inject
+		container-images/sidecar/hooks/precreate/seal-inject \
+		container-images/proxy/auth-proxy
 	$(CTR) rmi $(SIDECAR_IMAGE) 2>/dev/null || true
 	$(CTR) rmi $(CLAUDE_IMAGE) 2>/dev/null || true
 	$(CTR) rmi $(OPENCODE_IMAGE) 2>/dev/null || true
+	$(CTR) rmi $(PROXY_IMAGE) 2>/dev/null || true

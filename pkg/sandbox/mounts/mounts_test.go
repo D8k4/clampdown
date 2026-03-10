@@ -158,7 +158,8 @@ func (a *testAgent) ConfigOverlays() []agent.Mount      { return a.overlays }
 func (a *testAgent) Env() map[string]string             { return nil }
 func (a *testAgent) Args(passthrough []string) []string { return passthrough }
 func (a *testAgent) PromptFile() string                 { return "" }
-func (a *testAgent) ForwardEnv() []string               { return nil }
+func (a *testAgent) ProxyRoutes() []agent.ProxyRoute                        { return nil }
+func (a *testAgent) ProxyEnvOverride(_ []agent.ProxyRoute) map[string]string { return nil }
 
 func TestBuild_ProtectionMounts(t *testing.T) {
 	workdir := t.TempDir()

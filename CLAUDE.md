@@ -95,7 +95,7 @@ Automatic — do not wait for user to ask.
 
 ## Architecture
 
-Two-container model running under rootless podman (or Docker):
+Three-container model running under rootless podman (or Docker):
 
 ```
 HOST
@@ -108,11 +108,20 @@ HOST
      │   User: 0:0 inside userns (--userns=keep-id maps host uid)
      │   NO Landlock (incompatible with mount())
      │
+     ├─ AUTH PROXY (FROM scratch, read-only rootfs)
+     │   Entrypoint: sandbox-seal -- auth-proxy
+     │   Holds real API keys, proxies requests to upstream APIs
+     │   Seccomp: workload profile (~115 blocked, W^X)
+     │   Caps: cap-drop=ALL, Landlock ConnectTCP:[443,53]
+     │   128m memory, 16 PIDs, ulimit core=0:0
+     │   --network container:SIDECAR
+     │
      └─ AGENT (Alpine, --network container:SIDECAR)
-         Entrypoint: sandbox-seal -- claude
-         Seccomp: workload profile (~120 blocked, W^X)
+         Entrypoint: sandbox-seal -- <agent binary>
+         Gets dummy key (sk-proxy) + base URL → localhost proxy
+         Seccomp: workload profile (~115 blocked, W^X)
          Caps: cap-drop=ALL
-         Landlock V7 (filesystem, IPC scoping)
+         Landlock V7 (filesystem, IPC scoping, ConnectTCP:[443,2375,2376])
          Read-only rootfs, no-new-privileges
          Spawns NESTED containers via sidecar's podman API
 ```
@@ -135,14 +144,15 @@ pkg/
     app.go                       urfave/cli commands (agent subcommands, network, session)
     config.go                    Config file loading ($XDG_CONFIG_HOME/clampdown/config.json)
   container/
-    runtime.go                   Runtime interface (StartSidecar, StartAgent, Exec, List, etc.)
+    runtime.go                   Runtime interface (StartSidecar, StartProxy, StartAgent, Exec, List, etc.)
     podman.go                    Podman implementation
     docker.go                    Docker implementation
     detect.go                    Runtime auto-detection
   sandbox/
-    sandbox.go                   Run() orchestrator — starts sidecar, waits for API, starts agent
+    sandbox.go                   Run() orchestrator — starts sidecar, proxy, agent
     credentials.go               Opt-in host credential forwarding (gitconfig, gh, ssh)
-    config.go                    Sidecar/agent config builders, Landlock policy, allowlist resolution
+    config.go                    Sidecar/agent/proxy config builders, Landlock policy, proxy routing
+    rcfile.go                    .clampdownrc loading (global + per-project KEY=VALUE)
     paths.go                     Per-project cache paths (hashed workdir)
     integration_test.go          Integration tests (build tag: integration)
     mounts/mounts.go             Mount building: workdir, protected paths, config overlays, state dir
@@ -178,6 +188,10 @@ container-images/
     Containerfile                Claude agent image (Alpine + claude CLI + podman-remote)
   opencode/
     Containerfile                OpenCode agent image (Alpine + native Bun binary)
+  proxy/
+    proxy.go                     Auth proxy: reverse proxy with API key injection (stdlib only)
+    Containerfile                FROM scratch proxy image (seal + auth-proxy + CA certs)
+    go.mod                       Separate module (stdlib only)
 tools/
   extract-syscalls.sh            Static syscall extractor — disassembles binaries/images to identify required syscalls for seccomp tuning
 pkg/sandbox/seccomp/
@@ -188,21 +202,21 @@ pkg/sandbox/seccomp/
 ## Build
 
 ```bash
-make all               # builds: sidecar image, claude and opencode agent images, launcher binary
+make all               # builds: sidecar, proxy, claude, opencode images + launcher binary
 make test              # runs all unit tests
 make test-integration  # builds sidecar, runs integration tests (needs podman + internet)
 make sidecar           # builds Go binaries on host, then sidecar container image
+make proxy             # builds proxy auth image
 make claude            # copies seal into container-images/claude/, builds claude agent image
 make opencode          # copies seal into container-images/opencode/, builds opencode agent image
 make launcher          # CGO_ENABLED=0 go build
 make install           # installs to ~/.local/bin/
 ```
 
-All four Go binaries (seal, entrypoint, security-policy, seal-inject) are built on
-the host by Make (`CGO_ENABLED=0`), then COPY'd into the sidecar image. The
-Containerfile only assembles the final FROM scratch image — no Go compilation inside
-container builds. The C rename shim, podman-static download, and iptables extraction
-remain as Containerfile build stages.
+All five Go binaries (seal, entrypoint, security-policy, seal-inject, auth-proxy)
+are built on the host by Make (`CGO_ENABLED=0`), then COPY'd into their respective
+FROM scratch images. No Go compilation inside container builds. The C rename shim,
+podman-static download, and iptables extraction remain as Containerfile build stages.
 
 Container image builds use stamp files (`.sidecar.stamp`, `.claude.stamp`, etc.) —
 Make skips rebuilds when no source file changed.
@@ -222,21 +236,17 @@ export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY, GEMINI_API_KEY, etc.
 ./clampdown opencode
 ```
 
-API keys are forwarded from the host environment into the agent container automatically.
-Only keys that are set on the host are passed through. Each agent declares which keys
-it needs in `ForwardEnv()`.
+API keys are passed to the auth proxy container, never to the agent. The agent
+receives a dummy key (`sk-proxy`) and a base URL pointing at the local proxy.
+Keys are resolved from the host environment or `.clampdownrc`. Each agent
+declares its provider routes in `ProxyRoutes()`.
 
-Build agent images before first use:
+Build images before first use:
 ```bash
 make sidecar          # required for all agents
+make proxy            # auth proxy (required for API key isolation)
 make claude           # or: make opencode
 ```
-
-### Agent-specific notes
-
-**OpenCode:** Multi-provider — egress allowlist only includes OpenCode infrastructure
-domains. Users must add their AI provider domain via `--agent-allow` (e.g.
-`--agent-allow api.anthropic.com`).
 
 ## Key Design Decisions
 
@@ -259,7 +269,7 @@ domains. Users must add their AI provider domain via `--agent-allow` (e.g.
 - **Landlock is a hard requirement.** The launcher checks `/sys/kernel/security/lsm`
   at startup. If Landlock is confirmed absent, the session refuses to start. If the
   file is unreadable (e.g., container-in-container), it warns and lets seal enforce
-  inside. Kernel < 6.7 triggers a warning (Landlock present but lacks V6 IPC scoping).
+  inside. Kernel < 6.12 triggers a warning (Landlock present but lacks IPC + TCP scoping).
 - **Yama ptrace_scope preflight.** The launcher reads `/proc/sys/kernel/yama/ptrace_scope`
   at startup. Warns if Yama is absent or ptrace_scope is 0 (permissive). Advisory only —
   ptrace is independently blocked by seccomp, but Yama is defense-in-depth from a
@@ -300,9 +310,8 @@ domains. Users must add their AI provider domain via `--agent-allow` (e.g.
 - **"landlock LSM is not enabled"** — The launcher hard-fails if Landlock is absent from
   `/sys/kernel/security/lsm`. Enable it: boot with `lsm=landlock,...` or set
   `CONFIG_LSM=landlock,...` in kernel config.
-- **"Kernel X.Y lacks Landlock IPC scoping"** — Warning only (not fatal). Kernel < 6.7
-  lacks Landlock V6 IPC scoping. Abstract unix socket isolation is degraded. Upgrade
-  to kernel 6.7+ for full protection.
+- **"Kernel X.Y lacks Landlock IPC and TCP scoping"** — Warning only (not fatal).
+  Kernel < 6.12 lacks full Landlock IPC + TCP scoping. Upgrade to kernel 6.12+.
 - **Landlock hard-fails on kernel < 6.2** — seal.go requires ABI V3+. V4+ features
   (TCP connect, IoctlDev, IPC scoping) degrade via BestEffort.
 
@@ -349,6 +358,7 @@ Manual verification:
 
 **Launcher** (`go.mod`): `urfave/cli/v3`, `fsnotify/fsnotify`.
 **Seal** (`sidecar/seal/go.mod`): `go-landlock`, `golang.org/x/sys`, `libcap/psx`.
+**Proxy** (`proxy/go.mod`): stdlib only, no external dependencies.
 **Entrypoint, hooks** (`go.mod` each): stdlib only, no external dependencies.
 **Host build**: Go toolchain (all binaries built on host, not in containers).
 **Container images**: Alpine, podman-static v5.8.0 (no golang image needed at build time).

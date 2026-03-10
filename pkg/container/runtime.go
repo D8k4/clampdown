@@ -22,6 +22,7 @@ type Runtime interface {
 	PushImage(ctx context.Context, sidecar string, images []string) error
 	Remove(ctx context.Context, names ...string) error
 	StartAgent(ctx context.Context, cfg AgentContainerConfig) error
+	StartProxy(ctx context.Context, cfg ProxyContainerConfig) error
 	StartSidecar(ctx context.Context, cfg SidecarContainerConfig) error
 }
 
@@ -91,6 +92,18 @@ type AgentContainerConfig struct {
 	SidecarName    string
 	Tmpfs          []TmpfsSpec
 	Workdir        string
+}
+
+// ProxyContainerConfig describes the auth proxy container.
+// The proxy holds API keys and forwards requests to upstream APIs.
+type ProxyContainerConfig struct {
+	Env            map[string]string
+	Image          string
+	Labels         map[string]string
+	Name           string
+	Resources      Resources
+	SeccompProfile string
+	SidecarName    string
 }
 
 // Resources defines container resource limits.

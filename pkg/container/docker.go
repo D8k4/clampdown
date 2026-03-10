@@ -101,6 +101,44 @@ func (d *Docker) StartSidecar(ctx context.Context, cfg SidecarContainerConfig) e
 	return cmd.Run()
 }
 
+func (d *Docker) StartProxy(ctx context.Context, cfg ProxyContainerConfig) error {
+	args := []string{"run", "-d", "--name", cfg.Name,
+		"--user", d.uid() + ":" + d.gid(),
+		"--network", "container:" + cfg.SidecarName,
+		"--cap-drop=ALL",
+		"--read-only",
+		"--security-opt", "no-new-privileges",
+		"--security-opt", "seccomp=" + cfg.SeccompProfile,
+		"--ulimit", "core=0:0",
+		"--tmpfs", "/tmp:rw,noexec,nosuid,size=1m",
+	}
+
+	if cfg.Resources.Memory != "" {
+		args = append(args, "--memory="+cfg.Resources.Memory)
+	}
+	if cfg.Resources.CPUs != "" {
+		args = append(args, "--cpus="+cfg.Resources.CPUs)
+	}
+	if cfg.Resources.PIDLimit > 0 {
+		args = append(args, fmt.Sprintf("--pids-limit=%d", cfg.Resources.PIDLimit))
+	}
+
+	for k, v := range cfg.Env {
+		args = append(args, "-e", k+"="+v)
+	}
+	for k, v := range cfg.Labels {
+		args = append(args, "--label", k+"="+v)
+	}
+
+	args = append(args, cfg.Image)
+
+	cmd := exec.CommandContext(ctx, d.bin(), args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	slog.Debug("exec", "cmd", cmd.Args)
+	return cmd.Run()
+}
+
 func (d *Docker) StartAgent(ctx context.Context, cfg AgentContainerConfig) error {
 	uid, gid := d.uid(), d.gid()
 	uidGID := uid + ":" + gid

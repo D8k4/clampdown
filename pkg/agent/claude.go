@@ -50,6 +50,16 @@ func (c *Claude) PromptFile() string {
 	return filepath.Join(Home, ".claude", "CLAUDE-clampdown.md")
 }
 
-func (c *Claude) ForwardEnv() []string {
-	return []string{"ANTHROPIC_API_KEY"}
+func (c *Claude) ProxyRoutes() []ProxyRoute {
+	return []ProxyRoute{
+		{
+			Port:       ProxyPort,
+			Upstream:   "https://api.anthropic.com",
+			KeyEnv:     "ANTHROPIC_API_KEY",
+			HeaderName: "x-api-key",
+			BaseURLEnv: "ANTHROPIC_BASE_URL",
+		},
+	}
 }
+
+func (c *Claude) ProxyEnvOverride(_ []ProxyRoute) map[string]string { return nil }

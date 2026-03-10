@@ -83,22 +83,29 @@ func Delete(ctx context.Context, rt container.Runtime, sessionID string) error {
 		return fmt.Errorf("no containers found for session %s", sessionID)
 	}
 
-	// Remove agents before sidecars — the agent's network namespace
-	// depends on the sidecar, so the sidecar can't be removed first.
-	var agents, sidecars []string
+	// Remove order: agents → proxies → sidecars.
+	// Agent and proxy network namespaces depend on the sidecar.
+	var agents, proxies, sidecars []string
 	for _, info := range infos {
-		if info.Labels["clampdown.role"] == "sidecar" {
+		switch info.Labels["clampdown.role"] {
+		case "sidecar":
 			sidecars = append(sidecars, info.Name)
-		} else {
+		case "proxy":
+			proxies = append(proxies, info.Name)
+		default:
 			agents = append(agents, info.Name)
 		}
 	}
 
-	err = rt.Remove(ctx, append(agents, sidecars...)...)
+	var all []string
+	all = append(all, agents...)
+	all = append(all, proxies...)
+	all = append(all, sidecars...)
+	err = rt.Remove(ctx, all...)
 	if err != nil {
 		return fmt.Errorf("remove containers: %w", err)
 	}
-	slog.Info("removed session containers", "count", len(agents)+len(sidecars), "session", sessionID)
+	slog.Info("removed session containers", "count", len(all), "session", sessionID)
 	return nil
 }
 

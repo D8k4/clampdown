@@ -1,4 +1,4 @@
-<\!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
 
 # clampdown Security Model
 
@@ -11,7 +11,7 @@
 │  ┌───────────────┐                                                       │
 │  │  Launcher     │  clampdown CLI (Go binary)                            │
 │  │  (host PID)   │  Checks Landlock LSM, resolves DNS allowlists,        │
-│  │               │  writes seccomp, starts sidecar, waits, starts agent. │
+│  │               │  writes seccomp, starts sidecar, proxy, agent.        │
 │  └──────┬────────┘                                                       │
 │         │                                                                │
 │         │  podman run (rootless)                                         │
@@ -40,237 +40,44 @@
 │  │                                                                  │    │
 │  │  OCI Hooks (intercept nested container lifecycle):               │    │
 │  │    precreate:    seal-inject (policy, UID, seal mount, masking)  │    │
-│  │    createRuntime: security-policy (15 checks — see Layer 4)      │    │
+│  │    createRuntime: security-policy (15 checks)                    │    │
 │  │                                                                  │    │
 │  │  ┌─────────────────────────────────────────────────────────┐     │    │
 │  │  │ NESTED CONTAINERS  (podman run/build inside sidecar)    │     │    │
 │  │  │                                                         │     │    │
-│  │  │  Seccomp: seccomp_nested.json (via containers.conf)     │     │    │
-│  │  │    Blocks ~115 dangerous syscalls workloads never need: │     │    │
-│  │  │    mount, pivot_root, setns, chroot, ptrace, bpf,       │     │    │
-│  │  │    io_uring, splice/tee/vmsplice, clone3, seccomp,      │     │    │
-│  │  │    keyctl, init/delete_module, reboot, swapon/off,      │     │    │
-│  │  │    ioperm/iopl, clock_settime, SysV IPC, mknod,         │     │    │
-│  │  │    new mount API (fsopen/fsmount/move_mount/...), etc.  │     │    │
-│  │  │    Identical to agent seccomp (unified workload profile)│     │    │
-│  │  │    Layered ON TOP of inherited sidecar seccomp.         │     │    │
-│  │  │                                                         │     │    │
-│  │  │  Entrypoint: /.sandbox/seal -- <original command>       │     │    │
-│  │  │    • Apply Landlock V7 (fs + net + IPC)                 │     │    │
-│  │  │    • Close FDs ≥ 3 (close-on-exec)                      │     │    │
-│  │  │    • exec → original entrypoint                         │     │    │
-│  │  │                                                         │     │    │
-│  │  │  LD_PRELOAD: /.sandbox/rename_exdev_shim.so             │     │    │
-│  │  │    • Intercepts rename/renameat/renameat2               │     │    │
-│  │  │    • Falls back to copy+unlink on EXDEV                 │     │    │
+│  │  │  Seccomp: workload profile (~115 blocked)               │     │    │
+│  │  │  Entrypoint: sandbox-seal -- <original command>         │     │    │
+│  │  │  Landlock V7 (derived from mounts by seal-inject)       │     │    │
+│  │  │  LD_PRELOAD: rename_exdev_shim.so (EXDEV fallback)      │     │    │
 │  │  └─────────────────────────────────────────────────────────┘     │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │ AUTH PROXY CONTAINER  (FROM scratch, read-only rootfs)           │    │
+│  │                                                                  │    │
+│  │  Entrypoint: sandbox-seal -- auth-proxy                          │    │
+│  │  Listens: 127.0.0.1:2376 → upstream API (rewrites auth header)   │    │
+│  │                                                                  │    │
+│  │  Seccomp: workload profile (~115 blocked)                        │    │
+│  │  Landlock: ReadOnly:[/], ReadExec:[/usr/local/bin]               │    │
+│  │           ConnectTCP:[443, 53]                                   │    │
+│  │  cap-drop=ALL, ulimit core=0:0, 128m, 16 PIDs                    │    │
+│  │  No workdir, no HOME, no devices, no shell                       │    │
 │  └──────────────────────────────────────────────────────────────────┘    │
 │                                                                          │
 │  ┌──────────────────────────────────────────────────────────────────┐    │
 │  │ AGENT CONTAINER  (Alpine, --network container:SIDECAR)           │    │
 │  │                                                                  │    │
-│  │  Seccomp: seccomp_agent.json (identical to seccomp_nested.json)  │    │
-│  │    Blocks ~115 dangerous syscalls (unified workload profile)     │    │
+│  │  Entrypoint: sandbox-seal -- <agent binary>                      │    │
+│  │  Seccomp: workload profile (~115 blocked)                        │    │
+│  │  Landlock: workdir RWX, rootfs RO, ConnectTCP:[443,2375,2376]    │    │
+│  │  cap-drop=ALL, no-new-privileges, read-only rootfs               │    │
 │  │                                                                  │    │
-│  │  Entrypoint: /usr/local/bin/sandbox-seal -- claude               │    │
-│  │    • Landlock: workdir RWX, rootfs RO, binaries RX               │    │
-│  │    • cap-drop=ALL, no-new-privileges, read-only rootfs           │    │
-│  │    • Shares sidecar's network namespace (firewalled)             │    │
-│  │    • Uses sidecar's podman API to spawn nested containers        │    │
-│  │                                                                  │    │
-│  │  Web access:                                                     │    │
-│  │    • WebSearch: allowed (API domain allowlisted)                 │    │
-│  │    • WebFetch: blocked (agent firewall)                          │    │
-│  │    • Workaround: podman run alpine wget (pod egress is open)     │    │
-│  │                                                                  │    │
-│  │  Protected paths (read-only or masked):                          │    │
-│  │    .git/hooks  .git/config  .gitmodules  .vscode                 │    │
-│  │    .idea  .devcontainer  .envrc  .mcp.json                       │    │
+│  │  API keys: sk-proxy (dummy), BASE_URL=http://localhost:2376      │    │
+│  │  Protected paths: .git/hooks, .envrc, .mcp.json, etc.            │    │
+│  │  Inter-container comm: podman networks (not -p port publishing)  │    │
 │  └──────────────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────────────┘
-```
-
-## Defense Layers
-
-```
-Pre-launch: Launcher checks (hard-fail before any containers start)
-  │  checkLandlock: /sys/kernel/security/lsm must contain "landlock"
-  │    Absent + readable → hard error (session refuses to start)
-  │    Unreadable → warn (let seal enforce inside container)
-  │    Kernel < 6.7 → warn (Landlock V6 IPC scoping unavailable)
-  │  checkYama: /proc/sys/kernel/yama/ptrace_scope
-  │    Unreadable → warn (Yama LSM not detected)
-  │    Value 0 → warn (permissive, recommend ptrace_scope=1)
-  │    Advisory only — ptrace blocked by seccomp independently
-  │  warnIfRootful: rootful runtime → warning
-  │
-Layer 0: Host
-  │  Rootless podman, userns=keep-id
-  │  Seccomp profiles (sidecar + agent + nested)
-  │  AppArmor unconfined / SELinux container_engine_t <- sidecar
-  │  AppArmor confined / SELinux container_t <- agent
-  │
-Layer 1: Sidecar Entrypoint
-  │  /proc/sys read-only (except /proc/sys/net)
-  │  cgroup v2 with nsdelegate
-  │  iptables firewall (agent OUTPUT + pod FORWARD)
-  │  /run/sandbox/{uid,gid} immutable (chattr +i) + bind-mount RO
-  │
-Layer 2: Sidecar Seccomp (seccomp_sidecar.json)
-  │  Denylist — blocks dangerous syscalls NOT used by podman
-  │  Validated against syscalls.log (podman's full syscall set)
-  │  No excludes.caps (sidecar has SYS_ADMIN — would skip rules)
-  │  Inherited by ALL child processes (agent + nested containers)
-  │
-Layer 3: Workload Seccomp (seccomp_agent.json = seccomp_nested.json)
-  │  Unified profile — identical for agent and nested containers
-  │  Denylist — blocks ~115 dangerous syscalls workloads never need
-  │  13 categories: container escape, new mount API, device creation,
-  │  kernel code, kernel exploits, privilege escalation, keyring,
-  │  system disruption, hardware I/O, time, SysV IPC, NUMA, obsolete
-  │  Agent: applied at container start via --security-opt seccomp=
-  │  Nested: applied via containers.conf seccomp_profile directive
-  │  Nested layered on top of sidecar seccomp (kernel intersects both)
-  │  Cannot be bypassed — security-policy hook blocks seccomp=unconfined
-  │
-Layer 4: OCI Hooks (nested containers)
-  │  precreate: seal-inject
-  │    UID/GID enforcement (non-root)
-  │    sandbox-seal injected as entrypoint wrapper
-  │    Landlock policy derived from mounts
-  │    /proc masking (kallsyms, kcore, config.gz, modules)
-  │    /sys masking (debug, tracing, security, bpf, module, dmi)
-  │    hidepid=2 on procfs
-  │    NOTE: /proc/sysrq-trigger is NOT in maskedPaths — it's in
-  │    default readonlyPaths. maskedPaths uses /dev/null, and writes
-  │    to device nodes bypass ro mount flags (kernel routes to driver).
-  │
-  │  createRuntime: security-policy (15 checks)
-  │    checkCaps:              18 dangerous capabilities blocked
-  │    checkSeccomp:           seccomp=unconfined blocked
-  │    checkNoNewPrivileges:   no-new-privileges=false blocked (CVE-2023-0386)
-  │    checkNamespaces:        5 namespace types required, host joins blocked
-  │    checkMounts:            mount sources restricted to workdir + infra
-  │    checkMountOptions:      nosuid + nodev required on writable bind mounts
-  │    checkMountPropagation:  shared/rshared/slave/rslave blocked (CVE-2025-52881)
-  │    checkRootfsPropagation: non-private rootfs propagation blocked
-  │    checkDevices:           all device access blocked
-  │    checkMaskedPaths:       unmask of 12 custom masked paths blocked
-  │    checkReadonlyPaths:     unmask of /proc/sys, /proc/bus, /proc/fs, /proc/irq,
-  │                            /proc/sysrq-trigger blocked
-  │    checkSysctl:            all kernel parameter changes blocked (CVE-2022-0811)
-  │    checkRlimits:           RLIMIT_CORE override blocked (memory disclosure)
-  │    checkImageRef:          tag-only image refs warned or blocked
-  │    checkMountReadonly:     RW re-mount of sidecar RO paths blocked
-  │
-Layer 5: sandbox-seal (per-process)
-  │  Hard-fails if Landlock ABI < V3 (kernel < 6.2)
-  │  Landlock V7 filesystem MAC (4 tiers), BestEffort for V4+
-  │  Landlock IPC scoping (V6+, BestEffort)
-  │  PR_SET_NO_NEW_PRIVS (via Landlock)
-  │  FD ≥ 3 close-on-exec
-  │
-  │  NOTE: Landlock cannot be applied to the sidecar itself.
-  │  mount() internally triggers Landlock path hooks (EPERM).
-  │
-  │  NOTE: seal does NOT do cap pruning. Cap enforcement is handled
-  │  by containers.conf (10 default caps) + security-policy hook
-  │  (18 denied caps). seal-inject sets non-root UID →
-  │  no_new_privileges empties the effective set on exec.
-  │  Bounding caps are unreachable without effective caps.
-  │
-Layer 6: containers.conf (static defaults)
-  │  seccomp_profile = seccomp_nested.json
-  │  no_new_privileges = true
-  │  pids_limit = 256
-  │  default_capabilities (10 safe caps)
-  │  ulimit core=0:0
-  │  LD_PRELOAD rename shim (EXDEV fix)
-  │
-Layer 7: Host-side Watcher (tripwire)
-     Runs on the HOST, outside all container namespaces
-     inotify (fsnotify) on all RO-mounted host paths
-     Snapshots content + permissions before session start
-     Any write/create/delete/move → context cancel → kill session
-     On exit: restore modified files (sha256 compare), remove unexpected files
-     Disabled with --disable-tripwire
-     Last line of defense: sidecar UID mapping (uid 0 → subuid) prevents
-     writes, but a full escape to host uid 1000 bypasses in-container layers.
-     The watcher catches that.
-```
-
-## Seccomp Architecture (three-profile model)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  SIDECAR SECCOMP (seccomp_sidecar.json)                         │
-│  Applied at: container start (--security-opt seccomp=...)       │
-│  Scope: sidecar + ALL children (inherited by kernel)            │
-│  Approach: denylist (SCMP_ACT_ALLOW default)                    │
-│  Validated against: syscalls.log (podman's known syscall set)   │
-│  Aligned with: containers/common default seccomp profile        │
-│                                                                 │
-│  Blocks (~70 syscalls):                                         │
-│    io_uring_*, perf_event_open, userfaultfd, modify_ldt,        │
-│    kcmp, process_madvise, add_key, request_key,                 │
-│    kexec_load/file_load, init/delete/finit_module,              │
-│    splice/tee/vmsplice (Dirty Pipe), open_by_handle_at,         │
-│    swapoff/swapon, acct, vhangup, ioperm/iopl,                  │
-│    clock_settime/clock_settime64, setdomainname/sethostname,    │
-│    personality (arg-filtered), lookup_dcookie,                  │
-│    move_pages, migrate_pages, settimeofday, stime,              │
-│    quotactl_fd, socket(family≥17),                              │
-│    mmap/mmap2/mprotect/pkey_mprotect(PROT_WRITE+PROT_EXEC),     │
-│    ioctl(TIOCSTI/TIOCLINUX/IOC_WATCH_QUEUE_SET_FILTER),         │
-│    obsolete (20+), arch-specific (6), newer APIs (5)            │
-│                                                                 │
-│  Allows (needed by podman/crun):                                │
-│    mount, umount2, pivot_root, setns, clone, clone3,            │
-│    unshare, chroot, bpf, seccomp, keyctl, ptrace,               │
-│    execveat, quotactl, reboot, SysV IPC                         │
-│                                                                 │
-├─────────────────────────────────────────────────────────────────┤
-│  WORKLOAD SECCOMP (seccomp_agent.json = seccomp_nested.json)    │
-│  Applied at: agent start + nested containers (containers.conf)  │
-│  Scope: all workload processes (agent + nested containers)      │
-│  Approach: denylist (SCMP_ACT_ALLOW default)                    │
-│  Layered: nested runs ON TOP of inherited sidecar seccomp       │
-│  Both files are identical — unified workload profile            │
-│                                                                 │
-│  Blocks (~120 syscalls, 15 categories):                         │
-│    Container escape:  mount, umount*, pivot_root, setns,        │
-│                       chroot, open_by_handle_at,                │
-│                       clone(CLONE_NEWUSER), clone3,             │
-│                       unshare(CLONE_NEWUSER)                    │
-│    New mount API:     open_tree, move_mount, fsopen, fsconfig,  │
-│                       fsmount, mount_setattr                    │
-│    Device creation:   mknod, mknodat                            │
-│    Kernel code exec:  init/finit/delete_module, kexec_*         │
-│    Kernel exploits:   bpf, io_uring, userfaultfd, splice/tee,   │
-│                       vmsplice, modify_ldt, personality,        │
-│                       seccomp, fanotify_*, remap_file_pages     │
-│    W^X enforcement:   mmap/mmap2/mprotect/pkey_mprotect         │
-│                       (PROT_WRITE+PROT_EXEC blocked)            │
-│    Privilege escal:   ptrace, process_vm_*, kcmp, execveat      │
-│    Kernel keyring:    keyctl, add_key, request_key              │
-│    System disruption: reboot, swap*, acct, quotactl*, vhangup,  │
-│                       syslog                                    │
-│    Hardware I/O:      ioperm, iopl, pciconfig_*                 │
-│    Time manipulation: clock_settime*, adjtimex, settimeofday    │
-│    SysV IPC:          shm*, sem*, msg* (12 syscalls)            │
-│    Terminal inject:   ioctl(TIOCSTI), ioctl(TIOCLINUX)          │
-│    watch_queue:      ioctl(IOC_WATCH_QUEUE_SET_FILTER)          │
-│    NUMA:              move_pages, migrate_pages                 │
-│    Newer APIs:        cachestat, futex_requeue/wait/waitv/wake  │
-│    Obsolete:          bdflush, nfsservctl, uselib, vm86, ...    │
-│    Socket families:   AF_PACKET, AF_TIPC, AF_ALG, AF_VSOCK      │
-│                                                                 │
-│  Allows (workloads need):                                       │
-│    All file I/O, networking (AF_UNIX/INET/INET6/NETLINK),       │
-│    process management (fork, execve, wait), memory management,  │
-│    signals, scheduling, timers, epoll/poll, inotify, xattr,     │
-│    memfd_create (JIT), getrandom, statx, pidfd_*, landlock_*    │
-└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Network Policy
@@ -282,7 +89,10 @@ Layer 7: Host-side Watcher (tripwire)
                              │
               ┌──────────────▼────────────────┐
               │  SIDECAR NETWORK NAMESPACE    │
-              │  (shared by agent container)  │
+              │  (shared by proxy + agent)    │
+              │                               │
+              │  127.0.0.1:2375  podman API   │
+              │  127.0.0.1:2376  auth proxy   │
               │                               │
               │  filter/OUTPUT (agent egress) │
               │  ┌────────────────────────┐   │
@@ -313,38 +123,21 @@ Blocked CIDRs (IPv4):              Blocked CIDRs (IPv6):
   192.168.0.0/16                     fe80::/10
   127.0.0.0/8
   169.254.0.0/16 (cloud metadata)
-
-Agent allowlist (resolved at startup):
-  api.anthropic.com    claude.ai    platform.claude.com
-  sentry.io            statsig.anthropic.com
-  + container registries (docker.io, ghcr.io, quay.io, ...)
-  + user-provided domains
-
-Agent web access:
-  WebSearch: allowed (routes through API)
-  WebFetch: blocked by agent firewall (use pod wget instead)
 ```
 
-## Landlock Filesystem Policy (nested containers)
+## API Key Flow
 
 ```
-Tier        Access Rights                     Paths
-──────────  ────────────────────────────────  ──────────────────────────
-read_exec   read + execute                    /bin /sbin /usr/bin /usr/sbin
-                                              /usr/lib /usr/lib64 /usr/libexec
-                                              /usr/local /lib /lib64
-                                              /.sandbox
-
-read_only   read (no execute)                 / (entire rootfs)
-
-write_noexec read + write + create/delete     /dev /proc /tmp /var/tmp
-             (no execute, no device nodes)    /run /var/log /var/cache /var/lib
-
-write_exec  read + write + create/delete      /home
-            + execute                         + user bind mounts (workdir)
-
-All tiers include Refer (prevents spurious EXDEV across rule boundaries).
-MakeChar and MakeBlock excluded from all write tiers.
+┌─────────────┐     ┌──────────────┐     ┌─────────────────────┐
+│   AGENT     │     │  AUTH PROXY  │     │   UPSTREAM API      │
+│             │     │              │     │                     │
+│ API_KEY=    │     │ Holds real   │     │ api.anthropic.com   │
+│ "sk-proxy"  │────▶│ API key      │────▶│                     │
+│             │     │              │     │                     │
+│ BASE_URL=   │     │ Strips dummy │     │ Receives real       │
+│ localhost:  │     │ key, injects │     │ x-api-key header    │
+│ 2376        │     │ real key     │     │                     │
+└─────────────┘     └──────────────┘     └─────────────────────┘
 ```
 
 ## Capability Model
@@ -366,35 +159,25 @@ MakeChar and MakeBlock excluded from all write tiers.
            └────────────┬────────────┘
                         │
            ┌────────────▼────────────┐
-           │  AGENT (0 caps)         │
+           │  PROXY + AGENT (0 caps) │
            │  cap-drop=ALL           │
            └────────────┬────────────┘
                         │
            ┌────────────▼────────────┐
            │  NESTED (10 default)    │
-           │  containers.conf:       │
            │  CHOWN DAC_OVERRIDE     │
            │  FOWNER FSETID KILL     │
            │  NET_BIND_SERVICE       │
            │  SETFCAP SETGID SETPCAP │
-           │  SETUID                  │
+           │  SETUID                 │
            │                         │
-           │  Bounding: 10 caps      │
            │  Effective: empty       │
            │  (non-root + no ambient │
            │   + no_new_privileges)  │
            └─────────────────────────┘
-
-createRuntime hook BLOCKS (any set, 18 caps):
-  CAP_AUDIT_CONTROL  CAP_BPF  CAP_DAC_READ_SEARCH
-  CAP_LINUX_IMMUTABLE  CAP_MAC_ADMIN  CAP_MAC_OVERRIDE
-  CAP_MKNOD  CAP_NET_ADMIN  CAP_NET_RAW  CAP_PERFMON
-  CAP_SYS_ADMIN  CAP_SYS_BOOT  CAP_SYS_CHROOT
-  CAP_SYS_MODULE  CAP_SYS_PTRACE  CAP_SYS_RAWIO
-  CAP_SYS_RESOURCE  CAP_SYS_TIME
 ```
 
-## OCI Hook Pipeline (nested container lifecycle)
+## OCI Hook Pipeline
 
 ```
 podman run ...
@@ -402,8 +185,6 @@ podman run ...
      ▼
 ┌──────────────────────────────────────────────┐
 │  PRECREATE: seal-inject                      │
-│  (reads OCI config from stdin,               │
-│   writes modified config to stdout)          │
 │                                              │
 │  1. Overwrite process.user → sandbox UID/GID │
 │  2. Prepend /.sandbox/seal -- to args        │
@@ -413,18 +194,14 @@ podman run ...
 │  6. Add hidepid=2 to proc mount              │
 │  7. Append masked paths (/proc + /sys)       │
 │  8. Inject opt-in credentials                │
-│     (/run/credentials/* → nested container)  │
 └──────────────────┬───────────────────────────┘
                    │
      container created (crun)
                    │
                    ▼
 ┌─────────────────────────────────────────────┐
-│  CREATERUNTIME: security-policy             │
-│  (reads OCI state from stdin,               │
-│   reads config.json from bundle)            │
+│  CREATERUNTIME: security-policy (15 checks) │
 │                                             │
-│  Validates — blocks container on violation: │
 │   1. checkCaps             → EPERM          │
 │   2. checkSeccomp          → EPERM          │
 │   3. checkNoNewPrivileges  → EPERM          │
@@ -450,108 +227,183 @@ podman run ...
 │                                             │
 │  1. Parse SANDBOX_POLICY                    │
 │  2. applyLandlock (V7 BestEffort)           │
-│     → Hard-fail if ABI < V3 (kernel < 6.2)  │
-│     → PR_SET_NO_NEW_PRIVS set               │
-│     → Filesystem rules (4 tiers + Refer)    │
-│     → IPC scoping (V6+, BestEffort)         │
+│     → Filesystem (4 tiers + Refer)          │
+│     → IoctlDev in write tiers (V5+)         │
+│     → IPC scoping (V6+)                     │
+│     → ConnectTCP (V4+, if specified)        │
 │  3. closeExtraFDs (≥ 3 → close-on-exec)     │
 │  4. exec → original entrypoint              │
-└──────────────────┬──────────────────────────┘
-                   │
-     container runs (seccomp_nested + Landlock + caps active)
+└─────────────────────────────────────────────┘
 ```
 
-## Masked and Read-only Paths
+---
 
-```
-maskedPaths (seal-inject, bind /dev/null — hides content):
-  /proc/kallsyms       Kernel symbol addresses (KASLR bypass)
-  /proc/kcore          Physical memory in ELF format
-  /proc/config.gz      Kernel config (reveals security features)
-  /proc/modules        Loaded modules (attack surface enumeration)
+## How It Works
 
-  /sys/kernel/debug      ftrace, kprobes, memory state
-  /sys/kernel/tracing    ftrace tracing interface
-  /sys/kernel/security   LSM policy files
-  /sys/kernel/vmcoreinfo Kernel crash dump format layout
-  /sys/fs/bpf            Pinned eBPF maps/programs
-  /sys/module            Kernel module parameters
-  /sys/devices/virtual/dmi   Hardware fingerprint (DMI/SMBIOS)
+### Startup sequence
 
-requiredReadonlyPaths (security-policy validates presence):
-  /proc/bus            PCI/USB device enumeration
-  /proc/fs             Filesystem driver parameters
-  /proc/irq            Interrupt routing
-  /proc/sys            Kernel tunables (sysctl)
-  /proc/sysrq-trigger  Host crash/reboot
+The launcher runs on the host as a normal user process. Before starting
+any containers, it verifies that Landlock is available in the kernel and
+warns if Yama ptrace scope is too permissive or the runtime is rootful.
+It resolves the agent's domain allowlist to IP addresses, writes seccomp
+profiles to disk, and cleans up stale containers from previous sessions.
 
-  NOTE: /proc/sysrq-trigger uses readonlyPaths, NOT maskedPaths.
-  maskedPaths bind-mounts /dev/null (a device node) — writes to device
-  nodes bypass the ro mount flag (kernel routes to driver, not filesystem).
-  readonlyPaths bind-mounts the real proc entry read-only, which does
-  block writes.
+The sidecar starts first in detached mode. Its entrypoint hardens
+/proc/sys, bootstraps cgroup v2, builds the iptables firewall, writes
+the sandbox identity files (UID/GID, made immutable with chattr +i),
+then execs the podman system service.
 
-/proc mount options:
-  hidepid=2    Process sees only its own /proc/[pid] entries
-```
+Once the sidecar's podman API responds, the launcher checks whether an
+API key is available (from the host environment or .clampdownrc). If a
+key is found, the auth proxy starts in detached mode. The launcher waits
+for the "proxy: ready" log line, then starts the agent interactively.
+If no key is found, the agent starts without a proxy and a warning is
+printed.
 
-## File Provenance
+When the agent exits, all containers are removed in order: agent first,
+then proxy, then sidecar.
 
-```
-Sidecar image (FROM scratch):
-  /entrypoint                              Go, static (CGO_ENABLED=0)
-  /sandbox-seal                            Go, static (CGO_ENABLED=0)
-  /rename_exdev_shim.so                    C, musl -nostdlib (no DT_NEEDED)
-  /usr/libexec/oci/hooks.d/seal-inject     Go, static
-  /usr/libexec/oci/hooks.d/security-policy Go, static
-  /usr/local/bin/podman                    podman-static v5.8.0
-  /etc/containers/containers.conf          Hardened defaults + seccomp_profile
-  /etc/containers/seccomp_nested.json      Nested container seccomp profile
-  /etc/containers/policy.json              Image pull allowlist
+### API key isolation
 
-All Go binaries: CGO_ENABLED=0 → immune to LD_PRELOAD.
-The rename shim: -nostdlib → no libc DT_NEEDED, works on musl + glibc.
-Base images: pinned by SHA256 digest.
-```
+The agent never receives real API credentials. The launcher gives it a
+dummy key (`sk-proxy`) and overrides the API base URL to point at the
+local proxy on port 2376. The proxy receives the agent's request, strips
+the dummy auth header, injects the real API key, and forwards the
+request to the upstream API. The proxy logs every request (method, path,
+duration) to stderr.
 
-## Security Audit Notes
+Keys are resolved from two sources: the host environment and
+.clampdownrc. Neither source is forwarded into the agent container.
 
-Known false positives and expected findings from third-party audit tools
-(am-i-isolated, CDK, amicontained, DEEPCE, LinPEAS, linux-exploit-suggester).
-Last validated: 2026-03-02.
+For Claude, the SDK reads `ANTHROPIC_BASE_URL` directly. For OpenCode,
+most providers do not support a base URL environment variable. The
+launcher instead injects `OPENCODE_CONFIG_CONTENT` with the proxy URL,
+which OpenCode deep-merges at highest precedence over all other config.
+Each agent uses one provider at a time — the first matching key wins.
 
-```
-False positives:
-  LinPEAS "/proc/kallsyms readable"
-    open() succeeds because the mask is /dev/null (a device node), but
-    read returns empty — no kernel symbols are disclosed. Same device-node
-    behavior as /proc/sysrq-trigger (addressed via readonlyPaths).
+Even if the agent connects to the upstream API directly on port 443
+(allowed by Landlock for infrastructure like models.dev and telemetry),
+it sends `sk-proxy` as the key and gets 401. The real key only exists
+inside the proxy container, which has no shell, no writable filesystem,
+no capabilities, and core dumps disabled.
 
-  LinPEAS "Modules can be loaded"
-    init_module, finit_module, and delete_module are blocked by seccomp
-    in both sidecar and workload profiles. The check reads /proc/sys but
-    cannot act on it.
+### Landlock enforcement
 
-  am-i-isolated "Yama LSM not present"
-    /proc/kallsyms is masked (/dev/null), hiding the kernel symbol table
-    that the tool uses to detect Yama. The host has Yama active
-    (ptrace_scope=3 on Fedora 42). ptrace is independently blocked by
-    seccomp in workload profiles.
+sandbox-seal is the Landlock enforcement binary. It runs as the
+entrypoint wrapper for the agent, the proxy, and all nested containers.
+It reads a JSON policy from `SANDBOX_POLICY`, applies Landlock V7
+filesystem rules (four access tiers with IoctlDev for TTY operations),
+IPC scoping, and optional TCP port restriction, closes leaked file
+descriptors, then execs the real entrypoint.
 
-  DEEPCE "Inside Container: No"
-    Detection heuristic does not recognize clampdown's nested container
-    layout (sidecar + nested). Not a security gap.
+The agent's policy is built by the launcher from its mount
+configuration. The proxy gets a minimal read-only policy with TCP
+restricted to ports 443 and 53. Nested container policies are derived
+at runtime by the seal-inject OCI hook from each container's mount list.
 
-Kernel CVEs (monitor only):
-  CVE-2025-38236 (AF_UNIX MSG_OOB UAF)
-    Flagged by LinPEAS kernel CVE registry for kernel 6.18.9.
-    Kernel-level — cannot be fixed from inside the container.
-    Low practical risk: requires AF_UNIX MSG_OOB which is uncommon in
-    agent workloads. Wait for upstream kernel patch.
+Landlock requires kernel 6.2+ (ABI V3). Features from V4-V7 degrade
+gracefully via BestEffort. Landlock cannot be applied to the sidecar
+because mount() internally triggers Landlock path hooks (EPERM).
 
-  CVE-2022-2586, CVE-2021-22555 (netfilter)
-    Flagged by linux-exploit-suggester as "less probable". Both require
-    CAP_NET_ADMIN via unprivileged user namespaces. Mitigated: seccomp
-    blocks clone(CLONE_NEWUSER) and unshare(CLONE_NEWUSER) in workload
-    profiles, preventing capability acquisition via user namespaces.
-```
+### Network policy
+
+The sidecar, proxy, and agent share one network namespace. Agent egress
+is default-deny with a per-IP allowlist resolved from domain names at
+startup. DNS is rate-limited to 10 queries/second. Private CIDRs
+(RFC 1918, link-local, cloud metadata) are always blocked.
+
+Nested container (pod) egress is default-allow minus private CIDRs.
+Dynamic rules can be added at runtime via `clampdown network`.
+
+### OCI hooks
+
+When the agent runs `podman run` inside the sidecar, two OCI hooks
+intercept the container lifecycle before the workload starts.
+
+seal-inject (precreate) overwrites the user to the sandbox UID, prepends
+sandbox-seal to the entrypoint, derives a Landlock policy from the mount
+list, injects credential mounts if present, adds hidepid=2 to procfs,
+and masks sensitive /proc and /sys paths. It does not run for build
+containers.
+
+security-policy (createRuntime) validates the container against 15
+checks covering capabilities, seccomp, namespaces, mounts, devices,
+masked/readonly paths, sysctls, rlimits, image refs, and mount
+propagation. Each violation blocks the container with a specific errno.
+
+### Host-side tripwire
+
+The launcher monitors all read-only host paths via inotify. Before the
+session starts, it snapshots file content and permissions. Any
+modification kills the session immediately. On exit, it restores
+modified files and removes unexpected ones.
+
+This is the last defense layer. The sidecar's UID mapping prevents
+writes (container uid 0 maps to a sub-UID that doesn't own the files),
+but a full escape to the host user would bypass in-container protections.
+The tripwire runs outside all namespaces and catches that. Disabled with
+`--disable-tripwire`.
+
+---
+
+## Reference
+
+### Seccomp profiles
+
+Two profiles exist. The **sidecar profile** (~70 blocked syscalls) is a
+light denylist that blocks what the container engine never needs while
+allowing mount, bpf, ptrace, and clone for podman. The kernel inherits
+it to all child processes.
+
+The **workload profile** (~115 blocked syscalls) is stricter, applied to
+the agent, proxy, and nested containers. It blocks container escape
+primitives, the new mount API, device creation, kernel exploits,
+privilege escalation, kernel keyring, system disruption, hardware I/O,
+time manipulation, SysV IPC, terminal injection (TIOCSTI), and W^X
+memory. For nested containers it layers on top of the sidecar profile.
+
+### Landlock filesystem tiers (nested containers)
+
+| Tier | Rights | Typical paths |
+|------|--------|---------------|
+| read_exec | read, execute | /bin, /sbin, /usr, /lib, /.sandbox |
+| read_only | read | / (entire rootfs) |
+| write_noexec | read, write, create, delete, IoctlDev | /dev, /proc, /tmp, /run, /var |
+| write_exec | read, write, create, delete, execute, IoctlDev | /home, workdir |
+
+All tiers include Refer (prevents EXDEV). MakeChar/MakeBlock excluded.
+
+### Masked paths (nested containers)
+
+| Path | Reason |
+|------|--------|
+| /proc/kallsyms | Kernel symbol addresses (KASLR bypass) |
+| /proc/kcore | Physical memory dump |
+| /proc/config.gz | Kernel config (security feature disclosure) |
+| /proc/modules | Loaded modules (attack surface enumeration) |
+| /proc/version | Kernel version (exploit selection) |
+| /sys/kernel/debug | ftrace, kprobes |
+| /sys/kernel/tracing | ftrace tracing interface |
+| /sys/kernel/security | LSM policy files |
+| /sys/kernel/vmcoreinfo | Crash dump format layout |
+| /sys/fs/bpf | Pinned eBPF maps/programs |
+| /sys/module | Kernel module parameters |
+| /sys/devices/virtual/dmi | Hardware fingerprint |
+
+/proc/sysrq-trigger uses readonlyPaths (not maskedPaths) because writes
+to /dev/null device nodes bypass the ro mount flag.
+
+### File provenance
+
+All Go binaries are static (CGO_ENABLED=0), immune to LD_PRELOAD.
+Base images pinned by SHA256 digest.
+
+| Image | File | Notes |
+|-------|------|-------|
+| Sidecar | /entrypoint | Go, static |
+| Sidecar | /sandbox-seal | Go, static (go-landlock, x/sys, psx) |
+| Sidecar | /rename_exdev_shim.so | C, musl -nostdlib |
+| Sidecar | seal-inject, security-policy | Go, static, stdlib only |
+| Sidecar | /usr/local/bin/podman | podman-static v5.8.0 |
+| Proxy | /usr/local/bin/auth-proxy | Go, static, stdlib only |
+| Proxy | ca-certificates.crt | Alpine CA bundle |

@@ -30,7 +30,7 @@ clampdown runs three container types with different privilege levels:
 | Capabilities | 17 (`SYS_ADMIN`, `NET_ADMIN`, ...) | 0 (`cap-drop=ALL`) | 10 default (effective set empty) |
 | Seccomp | ~70 blocked | ~115 blocked | ~115 blocked + inherited sidecar |
 | Landlock | No (incompatible with `mount()`) | workdir RW, rootfs RO | Derived from bind mounts |
-| Secrets | Registry credentials (opt-in) | API keys | None |
+| Secrets | Registry credentials (opt-in) | None (`sk-proxy` dummy key) | None |
 | Network egress | N/A | Deny + allowlist only | Allow, private CIDRs blocked |
 | Rootfs | Read-only | Read-only | Read-only |
 | Runs as | root (userns-mapped) | Non-root | Non-root (hook-enforced) |
@@ -39,7 +39,9 @@ clampdown runs three container types with different privilege levels:
 
 - The sidecar is privileged enough to run podman and enforce firewall rules, but has no
 shell and no libc so it cannot be repurposed.  
-- The agent holds API keys and can reach its provider's endpoints, but nothing else.  
+- The agent never holds real API keys — it gets a dummy key and talks to a local auth
+proxy that injects the real credentials. Even if the agent connects to the upstream API
+directly, the dummy key produces a 401.
 - Tool containers have open egress to the public internet but hold no secrets: 
 they cannot reach private networks, and credentials are never forwarded unless explicitly opted in.
 
@@ -111,7 +113,7 @@ Tool containers launched by the agent get a derived policy based on their mount 
 writable access is granted only to paths explicitly bind-mounted into the container.
 
 Landlock V3 (kernel ≥ 6.2) is a hard requirement. The launcher refuses to start if
-Landlock is absent. Kernel ≥ 6.7 is recommended for full IPC namespace scoping.
+Landlock is absent. Kernel ≥ 6.12 is recommended for full IPC + TCP scoping.
 
 ### Network isolation
 
@@ -145,7 +147,7 @@ access sets, capability lists, OCI hook pipeline, and masked path inventory — 
 |-------------|---------|-------|
 | Linux | — | Landlock is Linux-only |
 | Kernel | ≥ 6.2 | Hard requirement. Session refuses to start below this. |
-| Kernel | ≥ 6.7 | Recommended. IPC namespace scoping (Landlock V6) requires 6.7+. |
+| Kernel | ≥ 6.12 | Recommended. IPC + TCP scoping (Landlock V6+) requires 6.12+. |
 | rootless podman | any recent | or Docker (rootful with a warning) or nerdctl |
 | Go | ≥ 1.23 | Build-time only |
 
@@ -166,9 +168,9 @@ make all      # builds sidecar image, agent images, and launcher binary
 make install  # copies binary to ~/.local/bin/clampdown
 ```
 
-`make all` builds three container images (`clampdown-sidecar`, `clampdown-claude`,
-`clampdown-opencode`) and the `clampdown` launcher binary. Images are rebuilt only when
-their source changes (stamp files).
+`make all` builds four container images (`clampdown-sidecar`, `clampdown-proxy`,
+`clampdown-claude`, `clampdown-opencode`) and the `clampdown` launcher binary. Images
+are rebuilt only when their source changes (stamp files).
 
 ---
 
@@ -217,12 +219,14 @@ The first run pulls base images and builds a per-project container storage cache
 
 ## Agents
 
-| Agent | Command | Provider keys forwarded |
+| Agent | Command | Supported provider keys |
 |-------|---------|------------------------|
 | Claude Code | `clampdown claude` | `ANTHROPIC_API_KEY` |
-| OpenCode | `clampdown opencode` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` |
+| OpenCode | `clampdown opencode` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` |
 
-Only keys that are set in the host environment are forwarded. Unset keys are not passed.
+Keys are passed to the auth proxy, not the agent. The first matching key (from host
+environment or `.clampdownrc`) activates the proxy for that provider. The agent
+receives a dummy key (`sk-proxy`) and a base URL pointing at the local proxy.
 
 ---
 
@@ -370,20 +374,21 @@ Persistent defaults live in `$XDG_CONFIG_HOME/clampdown/config.json` (typically
 
 ### .clampdownrc
 
-`KEY=VALUE` environment files for injecting additional env vars into the agent. Two
-locations are merged; project overrides global:
+`KEY=VALUE` files for API key configuration. Two locations are merged; project
+overrides global:
 
-- `~/.clampdownrc` — global
+- `~/.config/clampdown/clampdownrc` — global
 - `$workdir/.clampdownrc` — per-project
 
 ```sh
-# ~/.clampdownrc
+# ~/.config/clampdown/clampdownrc
 ANTHROPIC_API_KEY=sk-ant-...
 
 # myproject/.clampdownrc
-SOME_PROJECT_TOKEN=abc123
+ANTHROPIC_API_KEY=sk-ant-...   # project-specific key
 ```
 
+Keys from `.clampdownrc` are passed to the auth proxy, not to the agent container.
 Lines starting with `#` are comments. Values may be quoted with `"` or `'`.
 
 ---
@@ -391,10 +396,11 @@ Lines starting with `#` are comments. Values may be quoted with `"` or `'`.
 ## Building from source
 
 ```sh
-make all               # sidecar image + agent images + launcher
+make all               # sidecar + proxy + agent images + launcher
 make test              # all unit tests (no podman required)
 make test-integration  # integration tests (requires podman + internet)
 make sidecar           # sidecar image only
+make proxy             # auth proxy image only
 make claude            # claude agent image only
 make opencode          # opencode agent image only
 make launcher          # launcher binary only

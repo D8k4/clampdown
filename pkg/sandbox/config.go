@@ -17,6 +17,12 @@ import (
 	"github.com/89luca89/clampdown/pkg/sandbox/network"
 )
 
+// Infrastructure container images. Agent images are per-agent (Agent.Image()).
+const (
+	SidecarImage = "clampdown-sidecar:latest"
+	ProxyImage   = "clampdown-proxy:latest"
+)
+
 // LandlockPolicy matches the JSON expected by sandbox-seal.
 type LandlockPolicy struct {
 	ReadExec    []string `json:"read_exec"`
@@ -51,7 +57,7 @@ func sidecarConfig(
 		AuthFile:       authFile,
 		Labels:         labels(session, "sidecar", ag, opts),
 		Name:           name,
-		Image:          "clampdown-sidecar:latest",
+		Image:          SidecarImage,
 		Workdir:        opts.Workdir,
 		StorageDir:     p.Storage,
 		CacheDir:       p.Cache,
@@ -95,7 +101,7 @@ func agentConfig(
 	name, sidecarName string, session int, opts Options,
 	ag agent.Agent,
 	mounts []container.MountSpec, seccompPath string,
-	homeDir string, rcEnv map[string]string,
+	homeDir string, route *agent.ProxyRoute,
 ) container.AgentContainerConfig {
 	tmpfs := []container.TmpfsSpec{
 		{Path: "/run", Size: "256m", NoExec: true, NoSuid: true},
@@ -110,7 +116,16 @@ func agentConfig(
 	}
 	allMounts := append([]container.MountSpec{homeMnt}, mounts...)
 
-	policyJSON := AgentLandlockPolicy(allMounts, tmpfs)
+	// When a proxy route is active, the agent gets dummy keys and the proxy
+	// holds the real ones.
+	connectPorts := []uint16{443, 2375}
+	var keyEnv map[string]string
+	if route != nil {
+		connectPorts = append(connectPorts, route.Port)
+		keyEnv = proxyAgentEnv(ag, route)
+	}
+
+	policyJSON := AgentLandlockPolicy(allMounts, tmpfs, connectPorts)
 
 	return container.AgentContainerConfig{
 		Name:           name,
@@ -131,7 +146,7 @@ func agentConfig(
 			"SANDBOX_POLICY":  policyJSON,
 			"SANDBOX_SESSION": strconv.Itoa(session),
 			"TERM":            os.Getenv("TERM"),
-		}, ag.Env(), forwardEnv(ag), rcEnv),
+		}, ag.Env(), keyEnv),
 		Tmpfs:          tmpfs,
 		EntrypointArgs: ag.Args(opts.AgentArgs),
 	}
@@ -141,9 +156,11 @@ func agentConfig(
 // mount and tmpfs configuration. Mirrors what seal-inject does for
 // nested containers, but driven by the launcher's own config rather
 // than OCI config.json.
-//
-// No TCP restrictions — iptables handles network.
-func AgentLandlockPolicy(mounts []container.MountSpec, tmpfs []container.TmpfsSpec) string {
+// connectPorts restricts outbound TCP to listed ports only (V4+).
+func AgentLandlockPolicy(
+	mounts []container.MountSpec, tmpfs []container.TmpfsSpec,
+	connectPorts []uint16,
+) string {
 	p := LandlockPolicy{
 		ReadExec: []string{
 			"/bin", "/sbin", "/usr/bin", "/usr/sbin",
@@ -155,6 +172,7 @@ func AgentLandlockPolicy(mounts []container.MountSpec, tmpfs []container.TmpfsSp
 		// covered by ReadOnly on "/". Agent needs /dev/null, /dev/urandom,
 		// and /proc/self/* for normal operation.
 		WriteNoExec: []string{"/dev", "/proc"},
+		ConnectTCP:  connectPorts,
 	}
 
 	for _, t := range tmpfs {
@@ -308,21 +326,16 @@ func ensureClaudeOnboarding(path string) {
 	_ = os.WriteFile(path, append(out, '\n'), 0o644)
 }
 
-// forwardEnv reads host environment variables listed in ag.ForwardEnv()
-// and returns a map of those that are set. Used for API keys.
-func forwardEnv(ag agent.Agent) map[string]string {
-	names := ag.ForwardEnv()
-	if len(names) == 0 {
-		return nil
+// resolveKey looks up an API key by name, checking the host environment
+// first, then rcEnv (.clampdownrc). Returns the value and true if found.
+func resolveKey(name string, rcEnv map[string]string) (string, bool) {
+	if v := os.Getenv(name); v != "" {
+		return v, true
 	}
-	out := make(map[string]string, len(names))
-	for _, name := range names {
-		val := os.Getenv(name)
-		if val != "" {
-			out[name] = val
-		}
+	if v := rcEnv[name]; v != "" {
+		return v, true
 	}
-	return out
+	return "", false
 }
 
 func MergeEnv(envs ...map[string]string) map[string]string {
@@ -331,4 +344,85 @@ func MergeEnv(envs ...map[string]string) map[string]string {
 		maps.Copy(out, m)
 	}
 	return out
+}
+
+// ActiveProxyRoute returns the first proxy route whose key is set on the
+// host or in rcEnv.
+func ActiveProxyRoute(ag agent.Agent, rcEnv map[string]string) *agent.ProxyRoute {
+	for _, r := range ag.ProxyRoutes() {
+		_, ok := resolveKey(r.KeyEnv, rcEnv)
+		if ok {
+			return &r
+		}
+		if r.KeyEnvFallback != "" {
+			_, ok = resolveKey(r.KeyEnvFallback, rcEnv)
+			if ok {
+				r.KeyEnv, r.KeyEnvFallback = r.KeyEnvFallback, r.KeyEnv
+				return &r
+			}
+		}
+	}
+	return nil
+}
+
+// ProxyConfig builds the container config for the auth proxy.
+// The route configuration and API key are passed as individual env vars.
+func ProxyConfig(
+	name, sidecarName string, session int, opts Options,
+	ag agent.Agent, route *agent.ProxyRoute, seccompPath string,
+	rcEnv map[string]string,
+) container.ProxyContainerConfig {
+	// ActiveProxyRoute already resolved KeyEnvFallback into KeyEnv.
+	keyValue, _ := resolveKey(route.KeyEnv, rcEnv)
+
+	env := map[string]string{
+		"PROXY_PORT":          fmt.Sprintf("%d", route.Port),
+		"PROXY_UPSTREAM":      route.Upstream,
+		"PROXY_HEADER_NAME":   route.HeaderName,
+		"PROXY_HEADER_PREFIX": route.HeaderPrefix,
+		"PROXY_KEY":           keyValue,
+	}
+
+	// Landlock policy for the proxy: read-only filesystem, execute
+	// only its own binary, TCP connect restricted to port 443.
+	proxyPolicy := LandlockPolicy{
+		ReadExec:   []string{"/usr/local/bin"},
+		ReadOnly:   []string{"/"},
+		ConnectTCP: []uint16{443, 53},
+	}
+	data, _ := json.Marshal(proxyPolicy)
+	env["SANDBOX_POLICY"] = string(data)
+
+	return container.ProxyContainerConfig{
+		Name:           name,
+		Image:          ProxyImage,
+		Labels:         labels(session, "proxy", ag, opts),
+		SidecarName:    sidecarName,
+		Env:            env,
+		SeccompProfile: seccompPath,
+		Resources: container.Resources{
+			Memory: "128m", CPUs: "1", PIDLimit: 16,
+		},
+	}
+}
+
+func proxyAgentEnv(ag agent.Agent, route *agent.ProxyRoute) map[string]string {
+	env := make(map[string]string, 4)
+	if route.BaseURLEnv != "" {
+		env[route.BaseURLEnv] = fmt.Sprintf("http://localhost:%d", route.Port)
+	}
+	// Set dummy key so SDK key-presence validation passes.
+	env[route.KeyEnv] = "sk-proxy"
+	// If this route was resolved from a fallback, also set the original
+	// primary key env so the SDK finds it regardless of which name it
+	// checks first (e.g., GOOGLE_GENERATIVE_AI_API_KEY and GEMINI_API_KEY).
+	if route.KeyEnvFallback != "" {
+		env[route.KeyEnvFallback] = "sk-proxy"
+	}
+
+	// Agent-specific overrides (e.g., OPENCODE_CONFIG_CONTENT).
+	override := ag.ProxyEnvOverride([]agent.ProxyRoute{*route})
+	maps.Copy(env, override)
+
+	return env
 }
