@@ -381,6 +381,7 @@ func ProxyConfig(
 		"PROXY_HEADER_NAME":   route.HeaderName,
 		"PROXY_HEADER_PREFIX": route.HeaderPrefix,
 		"PROXY_KEY":           keyValue,
+		"GOMAXPROCS": "2",
 	}
 
 	// Landlock policy for the proxy: read-only filesystem, execute
@@ -401,7 +402,7 @@ func ProxyConfig(
 		Env:            env,
 		SeccompProfile: seccompPath,
 		Resources: container.Resources{
-			Memory: "128m", CPUs: "1", PIDLimit: 16,
+			Memory: "128m", CPUs: "1", PIDLimit: 32,
 		},
 	}
 }
