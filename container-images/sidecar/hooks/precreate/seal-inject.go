@@ -39,41 +39,6 @@ type mount struct {
 	Options     []string `json:"options,omitempty"`
 }
 
-// Sensitive /sys subtrees to mask in nested containers. The OCI runtime
-// replaces these with empty tmpfs mounts, preventing information disclosure.
-// Landlock exempts sysfs — mount-level masking is the only option.
-//   - /sys/kernel/debug: kernel debugfs (ftrace, kprobes, memory state).
-//   - /sys/kernel/tracing: ftrace tracing interface.
-//   - /sys/kernel/security: LSM policy files (AppArmor, SELinux, Landlock).
-//   - /sys/fs/bpf: pinned eBPF maps/programs (CVE-2021-3490 class).
-//   - /sys/module: loaded kernel module parameters.
-//   - /sys/devices/virtual/dmi: hardware fingerprint (DMI/SMBIOS data).
-var sysMaskedPaths = []string{
-	"/sys/kernel/debug",
-	"/sys/kernel/tracing",
-	"/sys/kernel/security",
-	"/sys/kernel/vmcoreinfo",
-	"/sys/fs/bpf",
-	"/sys/module",
-	"/sys/devices/virtual/dmi",
-}
-
-// procMaskedPaths are sensitive /proc paths masked to prevent info disclosure
-// that aids kernel exploit development (KASLR bypass, module enumeration).
-//
-// /proc/sysrq-trigger is intentionally NOT listed here. maskedPaths bind-mounts
-// /dev/null over the path, and writes to device nodes bypass the ro mount flag
-// (kernel routes writes to the device driver, not the filesystem). The default
-// OCI readonlyPaths already includes /proc/sysrq-trigger, which bind-mounts
-// the real proc entry read-only — that DOES block writes.
-var procMaskedPaths = []string{
-	"/proc/kallsyms",  // Kernel symbol addresses (KASLR bypass).
-	"/proc/kcore",     // Physical memory in ELF format.
-	"/proc/config.gz", // Kernel configuration (reveals security feature status).
-	"/proc/modules",   // Loaded kernel modules (attack surface enumeration).
-	"/proc/version",   // Kernel version string (fingerprinting for exploit selection).
-}
-
 // credentialSpecs defines opt-in host credential forwarding. The launcher
 // mounts credentials into the sidecar at /run/credentials/*. For each spec,
 // if the source exists in the sidecar filesystem, a read-only bind mount
@@ -329,24 +294,6 @@ func main() {
 			rawMounts[i], _ = json.Marshal(m)
 		}
 	}
-
-	// Mask sensitive /sys subtrees. Landlock exempts sysfs, so OCI
-	// maskedPaths (empty tmpfs overlays) is the only enforcement path.
-	var linux map[string]json.RawMessage
-	if config["linux"] != nil {
-		_ = json.Unmarshal(config["linux"], &linux)
-	}
-	if linux == nil {
-		linux = make(map[string]json.RawMessage)
-	}
-	var maskedPaths []string
-	if linux["maskedPaths"] != nil {
-		_ = json.Unmarshal(linux["maskedPaths"], &maskedPaths)
-	}
-	maskedPaths = append(maskedPaths, sysMaskedPaths...)
-	maskedPaths = append(maskedPaths, procMaskedPaths...)
-	linux["maskedPaths"], _ = json.Marshal(maskedPaths)
-	config["linux"], _ = json.Marshal(linux)
 
 	sealMount, _ := json.Marshal(mount{
 		Source:      sealBinary,

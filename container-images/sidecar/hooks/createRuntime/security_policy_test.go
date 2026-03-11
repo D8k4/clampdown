@@ -290,13 +290,83 @@ func TestCheckMaskedPaths_Removed(t *testing.T) {
 	}
 }
 
-func TestCheckMaskedPaths_SkipWithoutSeal(t *testing.T) {
+func TestCheckMaskedPaths_CoveredByROMount(t *testing.T) {
 	c := baseConfig()
-	c.Process.Args = []string{"sh"}
+	// Clear OCI maskedPaths — all paths covered by RO bind mounts instead
+	// (containers.conf volumes produce this layout).
 	c.Linux.MaskedPaths = nil
+
+	// Directory paths need an empty dir as source; file paths need /dev/null.
+	dirPaths := map[string]bool{
+		"/sys/kernel/debug":      true,
+		"/sys/kernel/tracing":    true,
+		"/sys/kernel/security":   true,
+		"/sys/fs/bpf":            true,
+		"/sys/module":            true,
+		"/sys/devices/virtual/dmi": true,
+	}
+	emptyDir := t.TempDir()
+
+	for _, p := range requiredMaskedPaths {
+		source := "/dev/null"
+		if dirPaths[p] {
+			source = emptyDir
+		}
+		c.Mounts = append(c.Mounts, struct {
+			Source      string   `json:"source"`
+			Destination string   `json:"destination"`
+			Type        string   `json:"type"`
+			Options     []string `json:"options"`
+		}{
+			Source:      source,
+			Destination: p,
+			Type:        "bind",
+			Options:     []string{"ro", "rbind"},
+		})
+	}
 	err := checkMaskedPaths(c)
 	if err != nil {
-		t.Errorf("expected pass without seal entrypoint, got: %v", err)
+		t.Errorf("expected pass with RO bind mounts covering all paths, got: %v", err)
+	}
+}
+
+func TestCheckMaskedPaths_NeitherMaskedNorMounted(t *testing.T) {
+	c := baseConfig()
+	c.Process.Args = []string{"sh"} // no seal — build container
+	c.Linux.MaskedPaths = nil       // no OCI maskedPaths
+	// no RO bind mounts either
+	err := checkMaskedPaths(c)
+	if err == nil {
+		t.Fatal("expected error when path is neither masked nor RO-mounted")
+	}
+}
+
+func TestCheckMaskedPaths_RejectsRegularFile(t *testing.T) {
+	c := baseConfig()
+	c.Linux.MaskedPaths = nil
+	// Mount a regular file (not /dev/null) over a required path.
+	// This should be rejected — only /dev/null or empty dirs count.
+	fakeFile := filepath.Join(t.TempDir(), "fake")
+	err := os.WriteFile(fakeFile, []byte("attacker content"), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range requiredMaskedPaths {
+		c.Mounts = append(c.Mounts, struct {
+			Source      string   `json:"source"`
+			Destination string   `json:"destination"`
+			Type        string   `json:"type"`
+			Options     []string `json:"options"`
+		}{
+			Source:      fakeFile,
+			Destination: p,
+			Type:        "bind",
+			Options:     []string{"ro", "rbind"},
+		})
+	}
+	err = checkMaskedPaths(c)
+	if err == nil {
+		t.Fatal("expected error when RO mount source is a regular file (not /dev/null)")
 	}
 }
 

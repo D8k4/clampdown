@@ -95,22 +95,33 @@ var deniedCaps = []string{
 // and we require containers to not use un-namespaced resources.
 var requiredNamespaces = []string{"pid", "network", "ipc", "mount", "cgroup"}
 
-// Sensitive paths that must stay masked (bind-mounted to /dev/null).
-// Injected by seal-inject (precreate hook); validated here to catch
-// --security-opt unmask=, unmask=ALL, or other stripping attempts.
+// Sensitive /proc and /sys paths that must be hidden from containers.
+// Primary enforcement is containers.conf volumes on the sidecar's read-only
+// rootfs: /dev/null for files, /empty for directories.
+// This applies uniformly to both podman run and podman build.
+// The agent cannot override these because:
+//   - The sidecar rootfs is read-only (containers.conf can't be modified).
+//   - CONTAINERS_CONF env can't be set (agent doesn't control sidecar env).
+//   - An explicit -v at the same destination replaces one mask with another
+//     (the real procfs/sysfs entry remains underneath, inaccessible).
+//     and mounts outside of workdir are blocked.
+//   - --security-opt unmask= only affects OCI maskedPaths, not bind volumes.
+//
+// checkMaskedPaths validates defense-in-depth: each path must be covered by
+// either OCI maskedPaths OR a /dev/null or /.empty bind mount in the spec.
 var requiredMaskedPaths = []string{
-	"/sys/kernel/debug",
-	"/sys/kernel/tracing",
-	"/sys/kernel/security",
-	"/sys/kernel/vmcoreinfo",
-	"/sys/fs/bpf",
-	"/sys/module",
-	"/sys/devices/virtual/dmi",
 	"/proc/kallsyms",
 	"/proc/kcore",
-	"/proc/config.gz",
 	"/proc/modules",
+	"/proc/sysrq-trigger",
 	"/proc/version",
+	"/sys/devices/virtual/dmi",
+	"/sys/fs/bpf",
+	"/sys/kernel/debug",
+	"/sys/kernel/security",
+	"/sys/kernel/tracing",
+	"/sys/kernel/vmcoreinfo",
+	"/sys/module",
 }
 
 // /proc/sysrq-trigger is in readonlyPaths, not maskedPaths. maskedPaths
@@ -134,6 +145,8 @@ var infraMountPrefixes = []string{
 	"/var/run/containers/storage",
 	"/var/cache/containers",
 	"/run/credentials",
+	"/dev/null",
+	"/empty",
 }
 
 func logf(format string, args ...any) {
@@ -342,13 +355,11 @@ func checkSysctl(config Config) error {
 func checkMountPropagation(config Config) error {
 	for _, m := range config.Mounts {
 		for _, opt := range m.Options {
-			for _, denied := range deniedPropagation {
-				if opt == denied {
-					return blocked(int(syscall.EPERM),
-						"mount propagation '%s' on '%s' not permitted in nested containers",
-						opt, m.Destination,
-					)
-				}
+			if slices.Contains(deniedPropagation, opt) {
+				return blocked(int(syscall.EPERM),
+					"mount propagation '%s' on '%s' not permitted in nested containers",
+					opt, m.Destination,
+				)
 			}
 		}
 	}
@@ -439,23 +450,64 @@ func checkRlimits(config Config) error {
 	return nil
 }
 
+// checkMaskedPaths verifies that every required sensitive path is hidden
+// by either OCI maskedPaths or a read-only bind mount whose source is
+// /dev/null (for files) or an empty directory (for dirs).
+// containers.conf volumes are the primary mechanism; this check is defense-in-depth.
 func checkMaskedPaths(config Config) error {
-	if len(config.Process.Args) == 0 || config.Process.Args[0] != "/.sandbox/seal" {
-		return nil
-	}
-	present := make(map[string]bool, len(config.Linux.MaskedPaths))
+	covered := make(map[string]bool, len(config.Linux.MaskedPaths))
 	for _, p := range config.Linux.MaskedPaths {
-		present[p] = true
+		covered[p] = true
 	}
+
+	for _, m := range config.Mounts {
+		if !hasOpt(m.Options, "ro") {
+			continue
+		}
+		if isDevNull(m.Source) || isEmptyDir(m.Source) {
+			covered[m.Destination] = true
+		}
+	}
+
 	for _, required := range requiredMaskedPaths {
-		if !present[required] {
+		if !covered[required] {
 			return blocked(int(syscall.EPERM),
-				"masked path '%s' was removed — unmask not permitted in nested containers",
+				"sensitive path '%s' is neither in maskedPaths nor covered by a /dev/null or empty-dir bind mount",
 				required,
 			)
 		}
 	}
 	return nil
+}
+
+// isDevNull returns true if path is /dev/null or a bind-mount of it
+func isDevNull(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	// Character device check: mode has S_IFCHR set.
+	if st.Mode&syscall.S_IFCHR == 0 {
+		return false
+	}
+	// /dev/null is major 1, minor 3.
+	major := (st.Rdev >> 8) & 0xff
+	minor := st.Rdev & 0xff
+	return major == 1 && minor == 3
+}
+
+// isEmptyDir returns true if path is an empty directory.
+func isEmptyDir(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	entries, err := os.ReadDir(path)
+	return err == nil && len(entries) == 0
 }
 
 func checkDevices(config Config) error {

@@ -41,7 +41,8 @@ RUN mkdir /iptables && apk add --initdb --root /iptables \
               /iptables/usr/share \
               /iptables/lib/apk \
     && find /iptables/etc -mindepth 1 -maxdepth 1 ! -name ssl -exec rm -rf {} + \
-    && find /iptables -empty -delete
+    && find /iptables -empty -delete \
+    && mkdir /empty
 
 FROM scratch
 # Minimal user database — podman needs to resolve UID 0 to find HOME.
@@ -64,6 +65,8 @@ COPY policy.json /etc/containers/policy.json
 COPY seccomp_nested.json /etc/containers/seccomp_nested.json
 # Alpine's iptables
 COPY --from=iptables /iptables/ /
+# Empty dir to mask volumes
+COPY --from=iptables /empty /empty
 COPY seal/sandbox-seal /sandbox-seal
 COPY entrypoint/entrypoint /entrypoint
 COPY hooks/createRuntime/security-policy /usr/libexec/oci/hooks.d/security-policy
